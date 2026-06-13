@@ -2,30 +2,22 @@
 """
 mcp-auth-relay
 ==============
-Lightweight MCP relay that sits between your MCP client and a local MCP server.
+Lightweight MCP relay with bearer token injection, manifest-based tools/list,
+integration pack support, SSE heartbeat, and first-run setup.
 
-What it does:
-  - Listens on a local port (default 8089)
-  - Injects a bearer token into every upstream request (client never sees or sends it)
-  - Serves tools/list from a manifest file even when the upstream server is offline
-  - Appends integration-supplied hints to tool descriptions at the proxy layer
-  - Answers initialize directly (no upstream needed)
-
-Setup:
-  1. Copy config.example.json to config.json and fill in your values
-  2. python proxy.py
-  3. Point your MCP client at http://127.0.0.1:8089/mcp
-
-Commands (type while running):
-  /packs   — browse and install integration packs
-  /status  — show current config and integration state
-  /reload  — reload config and integration without restart
-  /quit    — stop the relay
+Commands (type while running in a terminal):
+  /relay-setup   — startup preferences and configuration
+  /relay-packs   — browse and install integration packs
+  /relay-status  — current config and upstream health
+  /relay-reload  — reload config and integration without restart
+  /relay-quit    — stop the relay
 """
 
 import json
 import os
 import pathlib
+import platform
+import subprocess
 import sys
 import time
 import threading
@@ -36,74 +28,84 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_SCRIPT_PATH    = pathlib.Path(__file__).resolve()
+_CONFIG_PATH    = _SCRIPT_PATH.parent / "config.json"
+_INTEGRATIONS_DIR = _SCRIPT_PATH.parent.parent / "integrations"
+_PACKS_REPO     = "exetorius/mcp-auth-relay-integrations"
+_PACKS_BRANCH   = "main"
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = pathlib.Path(__file__).parent / "config.json"
-_INTEGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "integrations"
-_PACKS_REPO = "exetorius/mcp-auth-relay-integrations"
-_PACKS_BRANCH = "main"
-
 def _load_config() -> dict:
     defaults = {
-        "bearer_token":   "",
-        "proxy_port":     8089,
-        "upstream_host":  "127.0.0.1",
-        "upstream_port":  8088,
-        "manifest_path":  "",
-        "integration":    "",
-        "server_name":    "mcp-auth-relay",
-        "instructions":   "",
+        "bearer_token":       "",
+        "proxy_port":         8089,
+        "upstream_host":      "127.0.0.1",
+        "upstream_port":      8088,
+        "manifest_path":      "",
+        "integration":        "",
+        "server_name":        "mcp-auth-relay",
+        "instructions":       "",
+        "startup_asked":      False,
+        "startup_registered": False,
     }
     try:
         with open(_CONFIG_PATH) as f:
-            cfg = json.load(f)
-            return {**defaults, **cfg}
+            return {**defaults, **json.load(f)}
     except FileNotFoundError:
         return defaults
     except Exception as e:
         print(f"[relay] WARNING: could not read config.json: {e}", flush=True)
         return defaults
 
+def _save_config(updates: dict) -> None:
+    cfg = {}
+    if _CONFIG_PATH.exists():
+        try:
+            with open(_CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+    cfg.update(updates)
+    with open(_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
 _CFG = _load_config()
 
 PROXY_PORT    = int(_CFG["proxy_port"])
 UPSTREAM_URL  = f"http://{_CFG['upstream_host']}:{_CFG['upstream_port']}/mcp"
-UPSTREAM_PORT = int(_CFG["upstream_port"])
-UPSTREAM_HOST = _CFG["upstream_host"]
 BEARER_TOKEN  = _CFG["bearer_token"]
 SERVER_NAME   = _CFG["server_name"]
 INSTRUCTIONS  = _CFG["instructions"]
-
 MANIFEST_PATH = pathlib.Path(os.path.expandvars(_CFG["manifest_path"])) if _CFG["manifest_path"] else None
 
 # ---------------------------------------------------------------------------
 # Integration pack
 # ---------------------------------------------------------------------------
 
-_INTEGRATION_DIR: pathlib.Path | None = None
-_TOOL_HINTS: dict[str, str] = {}
-_SYNTHETIC_TOOLS: list[dict] = []
+_TOOL_HINTS:      dict[str, str] = {}
+_SYNTHETIC_TOOLS: list[dict]     = []
 
 def _load_integration(name: str) -> str:
-    """Load a named integration pack. Returns a status line for display."""
-    global _INTEGRATION_DIR, _TOOL_HINTS, _SYNTHETIC_TOOLS, INSTRUCTIONS
-
-    _INTEGRATION_DIR = None
+    global _TOOL_HINTS, _SYNTHETIC_TOOLS, INSTRUCTIONS
     _TOOL_HINTS.clear()
     _SYNTHETIC_TOOLS.clear()
 
     if not name:
         return ""
 
-    candidate = _INTEGRATIONS_DIR / name
-    if not candidate.exists():
-        return f"Integration pack '{name}' not found at {candidate}"
+    pack = _INTEGRATIONS_DIR / name
+    if not pack.exists():
+        return f"Integration pack '{name}' not found at {pack}"
 
-    _INTEGRATION_DIR = candidate
     parts = []
 
-    hints_path = candidate / "hints.json"
+    hints_path = pack / "hints.json"
     if hints_path.exists():
         try:
             with open(hints_path) as f:
@@ -112,7 +114,7 @@ def _load_integration(name: str) -> str:
         except Exception as e:
             parts.append(f"hints ERROR: {e}")
 
-    synth_path = candidate / "synthetic_tools.json"
+    synth_path = pack / "synthetic_tools.json"
     if synth_path.exists():
         try:
             with open(synth_path) as f:
@@ -121,7 +123,7 @@ def _load_integration(name: str) -> str:
         except Exception as e:
             parts.append(f"synthetic_tools ERROR: {e}")
 
-    instr_path = candidate / "instructions.md"
+    instr_path = pack / "instructions.md"
     if instr_path.exists() and not INSTRUCTIONS:
         try:
             INSTRUCTIONS = instr_path.read_text(encoding="utf-8")
@@ -129,7 +131,7 @@ def _load_integration(name: str) -> str:
         except Exception as e:
             parts.append(f"instructions ERROR: {e}")
 
-    return f"Integration '{name}' loaded — " + ", ".join(parts) if parts else f"Integration '{name}' loaded (empty pack)"
+    return (f"Integration '{name}' loaded — " + ", ".join(parts)) if parts else f"Integration '{name}' loaded"
 
 _integration_status = _load_integration(_CFG.get("integration", ""))
 
@@ -140,6 +142,153 @@ _integration_status = _load_integration(_CFG.get("integration", ""))
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+# ---------------------------------------------------------------------------
+# OS startup registration
+# ---------------------------------------------------------------------------
+
+_OS = platform.system()  # "Windows", "Darwin", "Linux"
+
+def _relay_launch_command() -> str:
+    return f'"{sys.executable}" "{_SCRIPT_PATH}"'
+
+def register_startup() -> tuple[bool, str]:
+    if _OS == "Windows":
+        cmd = (
+            f'schtasks /Create /TN "mcp-auth-relay" '
+            f'/TR \\"{_relay_launch_command()}\\" '
+            f'/SC ONLOGON /RL HIGHEST /F'
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True)
+        if result.returncode == 0:
+            return True, "Registered via Task Scheduler — relay will start automatically at login."
+        return False, f"Task Scheduler registration failed: {result.stderr.decode().strip()}"
+
+    elif _OS == "Darwin":
+        plist_dir  = pathlib.Path.home() / "Library" / "LaunchAgents"
+        plist_path = plist_dir / "com.mcp-auth-relay.plist"
+        plist_dir.mkdir(parents=True, exist_ok=True)
+        plist_path.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.mcp-auth-relay</string>
+    <key>ProgramArguments</key><array>
+        <string>{sys.executable}</string>
+        <string>{_SCRIPT_PATH}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+</dict></plist>
+""", encoding="utf-8")
+        subprocess.run(["launchctl", "load", str(plist_path)], capture_output=True)
+        return True, "Registered via launchd — relay will start automatically at login."
+
+    else:  # Linux / systemd
+        svc_dir = pathlib.Path.home() / ".config" / "systemd" / "user"
+        svc_dir.mkdir(parents=True, exist_ok=True)
+        (svc_dir / "mcp-auth-relay.service").write_text(f"""[Unit]
+Description=mcp-auth-relay
+After=network.target
+
+[Service]
+ExecStart={sys.executable} {_SCRIPT_PATH}
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+""", encoding="utf-8")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        r = subprocess.run(["systemctl", "--user", "enable", "mcp-auth-relay"], capture_output=True)
+        if r.returncode == 0:
+            return True, "Registered via systemd user service — relay will start automatically at login."
+        return False, f"systemd registration failed: {r.stderr.decode().strip()}"
+
+
+def unregister_startup() -> tuple[bool, str]:
+    if _OS == "Windows":
+        r = subprocess.run('schtasks /Delete /TN "mcp-auth-relay" /F', shell=True, capture_output=True)
+        if r.returncode == 0:
+            return True, "Removed from Task Scheduler."
+        return False, f"Could not remove: {r.stderr.decode().strip()}"
+
+    elif _OS == "Darwin":
+        plist_path = pathlib.Path.home() / "Library" / "LaunchAgents" / "com.mcp-auth-relay.plist"
+        subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+        plist_path.unlink(missing_ok=True)
+        return True, "Removed from launchd."
+
+    else:
+        subprocess.run(["systemctl", "--user", "disable", "mcp-auth-relay"], capture_output=True)
+        svc = pathlib.Path.home() / ".config" / "systemd" / "user" / "mcp-auth-relay.service"
+        svc.unlink(missing_ok=True)
+        return True, "Removed from systemd."
+
+# ---------------------------------------------------------------------------
+# Setup menu
+# ---------------------------------------------------------------------------
+
+def run_setup_menu(first_run: bool = False) -> None:
+    print(flush=True)
+    print("  ╔══════════════════════════════════════════╗", flush=True)
+    print("  ║          mcp-auth-relay  setup           ║", flush=True)
+    print("  ╚══════════════════════════════════════════╝", flush=True)
+    print(flush=True)
+
+    registered = _CFG.get("startup_registered", False)
+
+    if registered:
+        print("  Startup with OS: ENABLED", flush=True)
+        print(flush=True)
+        print("  1. Disable startup with OS", flush=True)
+        print("  2. Done", flush=True)
+        print(flush=True)
+        try:
+            choice = input("  Enter choice [1-2]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "2"
+
+        if choice == "1":
+            ok, msg = unregister_startup()
+            print(f"\n  {msg}", flush=True)
+            _save_config({"startup_registered": False, "startup_asked": True})
+        else:
+            print(flush=True)
+        return
+
+    print("  How would you like to start the relay?\n", flush=True)
+    print("  1. Start with OS  (recommended)", flush=True)
+    print("     Relay starts automatically at login — no manual step needed.", flush=True)
+    print(flush=True)
+    print("  2. Start manually each time", flush=True)
+    print("     Run 'python proxy.py' when you need it.", flush=True)
+    print(flush=True)
+    print("  3. Ask me next time", flush=True)
+    print("     Start now, prompt again on next launch.", flush=True)
+    print(flush=True)
+
+    try:
+        choice = input("  Enter choice [1-3]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = "3"
+
+    print(flush=True)
+
+    if choice == "1":
+        ok, msg = register_startup()
+        print(f"  {msg}", flush=True)
+        if not ok:
+            print("  You may need to run as administrator and try again.", flush=True)
+        _save_config({"startup_asked": True, "startup_registered": ok})
+
+    elif choice == "2":
+        print("  Got it — starting manually. Type /relay-setup anytime to change this.", flush=True)
+        _save_config({"startup_asked": True, "startup_registered": False})
+
+    else:
+        print("  OK — will ask again next time.", flush=True)
+        _save_config({"startup_asked": False, "startup_registered": False})
+
+    print(flush=True)
 
 # ---------------------------------------------------------------------------
 # Pack installer
@@ -180,17 +329,12 @@ def _download_pack(name: str) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-def _save_integration_to_config(name: str) -> None:
-    cfg = {}
-    if _CONFIG_PATH.exists():
-        try:
-            with open(_CONFIG_PATH) as f:
-                cfg = json.load(f)
-        except Exception:
-            pass
-    cfg["integration"] = name
-    with open(_CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_setup() -> None:
+    run_setup_menu()
 
 def cmd_packs() -> None:
     print("\n  Fetching available packs from GitHub...", flush=True)
@@ -204,12 +348,12 @@ def cmd_packs() -> None:
         print("  No packs found.", flush=True)
         return
 
-    print(f"\n  Available integration packs:\n", flush=True)
+    print("\n  Available integration packs:\n", flush=True)
     for i, name in enumerate(packs, 1):
         installed = (_INTEGRATIONS_DIR / name).exists()
         tag = " (installed)" if installed else ""
         print(f"    {i}. {name}{tag}", flush=True)
-    print(f"    0. Cancel\n", flush=True)
+    print("    0. Cancel\n", flush=True)
 
     try:
         choice = input("  Select pack number: ").strip()
@@ -232,24 +376,28 @@ def cmd_packs() -> None:
         return
 
     print(f"  {msg}", flush=True)
-    _save_integration_to_config(name)
+    _save_config({"integration": name})
     status = _load_integration(name)
     print(f"  {status}", flush=True)
-    print(f"  Integration active. config.json updated — token and ports preserved.\n", flush=True)
+    print(f"  Integration active — config.json updated.\n", flush=True)
 
 def cmd_status() -> None:
-    print(f"\n  mcp-auth-relay status", flush=True)
+    print(f"\n  mcp-auth-relay", flush=True)
+    print(f"  {'─' * 40}", flush=True)
     print(f"  Listening:    http://127.0.0.1:{PROXY_PORT}/mcp", flush=True)
     print(f"  Upstream:     {UPSTREAM_URL}", flush=True)
     print(f"  Token:        {'set' if BEARER_TOKEN else 'NOT SET'}", flush=True)
     print(f"  Manifest:     {MANIFEST_PATH or 'not configured'}", flush=True)
-    if MANIFEST_PATH:
-        tools = load_manifest()
-        print(f"  Tools:        {len(tools)} from manifest + {len(_SYNTHETIC_TOOLS)} synthetic", flush=True)
-    if _INTEGRATION_DIR:
-        print(f"  Integration:  {_INTEGRATION_DIR.name} ({len(_TOOL_HINTS)} hints, {len(_SYNTHETIC_TOOLS)} synthetic tools)", flush=True)
+    if MANIFEST_PATH and MANIFEST_PATH.exists():
+        print(f"  Tools:        {len(load_manifest())} from manifest + {len(_SYNTHETIC_TOOLS)} synthetic", flush=True)
+    if _INTEGRATIONS_DIR / _CFG.get('integration', ''):
+        intg = _CFG.get('integration', '')
+        if intg:
+            print(f"  Integration:  {intg} ({len(_TOOL_HINTS)} hints, {len(_SYNTHETIC_TOOLS)} synthetic tools)", flush=True)
     else:
-        print(f"  Integration:  none — type /packs to install one", flush=True)
+        print(f"  Integration:  none — type /relay-packs to install one", flush=True)
+    reg = _CFG.get("startup_registered", False)
+    print(f"  Startup:      {'enabled' if reg else 'manual'}", flush=True)
     print(flush=True)
 
 def cmd_reload() -> None:
@@ -258,16 +406,13 @@ def cmd_reload() -> None:
     BEARER_TOKEN = _CFG["bearer_token"]
     INSTRUCTIONS = _CFG["instructions"]
     status = _load_integration(_CFG.get("integration", ""))
-    print(f"  Reloaded config. {status or 'No integration.'}", flush=True)
-
-# ---------------------------------------------------------------------------
-# Interactive command loop (stdin, runs in a background thread)
-# ---------------------------------------------------------------------------
+    print(f"  Reloaded. {status or 'No integration.'}", flush=True)
 
 COMMANDS = {
-    "/packs":  cmd_packs,
-    "/status": cmd_status,
-    "/reload": cmd_reload,
+    "/relay-setup":  cmd_setup,
+    "/relay-packs":  cmd_packs,
+    "/relay-status": cmd_status,
+    "/relay-reload": cmd_reload,
 }
 
 def _command_loop() -> None:
@@ -275,17 +420,18 @@ def _command_loop() -> None:
         cmd = line.strip().lower()
         if not cmd:
             continue
-        if cmd in ("/quit", "/exit", "quit", "exit"):
+        if cmd in ("/relay-quit", "/relay-exit"):
             log("Relay stopped.")
             os._exit(0)
         handler = COMMANDS.get(cmd)
         if handler:
             handler()
         else:
-            print(f"  Unknown command '{cmd}'. Available: {', '.join(COMMANDS)} /quit", flush=True)
+            known = ", ".join(COMMANDS) + ", /relay-quit"
+            print(f"  Unknown command '{cmd}'. Available: {known}", flush=True)
 
 # ---------------------------------------------------------------------------
-# Manifest + hint helpers
+# Manifest + hints
 # ---------------------------------------------------------------------------
 
 def load_manifest() -> list:
@@ -302,7 +448,6 @@ def load_manifest() -> list:
             break
     return []
 
-
 def apply_hints(tools: list) -> list:
     for tool in tools:
         hint = _TOOL_HINTS.get(tool.get("name", ""))
@@ -312,28 +457,26 @@ def apply_hints(tools: list) -> list:
         yield tool
 
 # ---------------------------------------------------------------------------
-# Upstream forwarding
+# Upstream
 # ---------------------------------------------------------------------------
 
 def forward_to_upstream(body_bytes: bytes, headers: dict) -> tuple[bool, bytes]:
-    forward_headers = {
+    fwd = {
         "Content-Type":     "application/json",
         "Accept":           "application/json",
         "X-MCP-Auth-Relay": "true",
         "Connection":       "close",
     }
     if BEARER_TOKEN:
-        forward_headers["Authorization"] = f"Bearer {BEARER_TOKEN}"
+        fwd["Authorization"] = f"Bearer {BEARER_TOKEN}"
     for key in ("mcp-protocol-version",):
         if key in headers:
-            forward_headers[key] = headers[key]
+            fwd[key] = headers[key]
 
     last_exc = None
     for attempt in range(2):
         try:
-            req = urllib.request.Request(
-                UPSTREAM_URL, data=body_bytes, headers=forward_headers, method="POST",
-            )
+            req = urllib.request.Request(UPSTREAM_URL, data=body_bytes, headers=fwd, method="POST")
             with urllib.request.urlopen(req, timeout=120) as resp:
                 return True, resp.read()
         except urllib.error.HTTPError as e:
@@ -343,63 +486,48 @@ def forward_to_upstream(body_bytes: bytes, headers: dict) -> tuple[bool, bytes]:
         except (urllib.error.URLError, socket.timeout, OSError) as exc:
             last_exc = exc
             if attempt == 0:
-                log(f"Connection error (attempt {attempt + 1}), retrying: {exc}")
+                log(f"Connection error (attempt {attempt+1}), retrying: {exc}")
     log(f"Upstream unreachable after 2 attempts: {last_exc}")
     return False, b""
 
-
-def upstream_error_response(req_id, tool_name: str, upstream_message: str = "") -> dict:
-    if upstream_message:
-        text = (
-            f"Upstream server rejected the request: {upstream_message}\n"
-            f"Check that bearer_token in config.json matches the upstream server's expected token."
-        )
-    else:
-        text = (
-            f"Upstream server is not running.\n"
-            f"Please start your MCP server, then retry '{tool_name}'."
-        )
-    return {
-        "jsonrpc": "2.0", "id": req_id,
-        "result": {"content": [{"type": "text", "text": text}], "isError": True},
-    }
+def upstream_error_response(req_id, tool_name: str, msg: str = "") -> dict:
+    text = (
+        f"Upstream server rejected the request: {msg}\n"
+        f"Check that bearer_token in config.json matches the upstream server's expected token."
+        if msg else
+        f"Upstream server is not running.\nPlease start your MCP server, then retry '{tool_name}'."
+    )
+    return {"jsonrpc": "2.0", "id": req_id,
+            "result": {"content": [{"type": "text", "text": text}], "isError": True}}
 
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
 class RelayHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): pass
 
-    def log_message(self, fmt, *args):
-        pass
-
-    def _send_cors(self):
+    def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, MCP-Protocol-Version, mcp-session-id")
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self._send_cors()
-        self.end_headers()
+        self.send_response(200); self._cors(); self.end_headers()
 
     def do_GET(self):
-        accept = self.headers.get("Accept", "")
-        if "text/event-stream" not in accept:
+        if "text/event-stream" not in self.headers.get("Accept", ""):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
-            self._send_cors()
-            self.end_headers()
+            self._cors(); self.end_headers()
             self.wfile.write(b"mcp-auth-relay running")
             return
-
         log("SSE stream opened")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self._send_cors()
-        self.end_headers()
+        self._cors(); self.end_headers()
         try:
             while True:
                 self.wfile.write(b": heartbeat\n\n")
@@ -410,81 +538,71 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path != "/mcp":
-            self.send_response(404)
-            self.end_headers()
-            return
+            self.send_response(404); self.end_headers(); return
 
-        length = int(self.headers.get("Content-Length", 0))
+        length   = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(length)
-        lower_headers = {k.lower(): v for k, v in self.headers.items()}
+        lhdrs    = {k.lower(): v for k, v in self.headers.items()}
 
         try:
             rpc = json.loads(raw_body)
         except json.JSONDecodeError:
-            self._json(400, {"error": "Invalid JSON"})
-            return
+            self._json(400, {"error": "Invalid JSON"}); return
 
         method = rpc.get("method", "")
         req_id = rpc.get("id")
 
         if method == "initialize":
-            client_version = (rpc.get("params") or {}).get("protocolVersion", "2024-11-05")
-            log(f"initialize (protocol {client_version})")
-            self._jsonrpc(req_id, {
-                "protocolVersion": client_version,
+            ver = (rpc.get("params") or {}).get("protocolVersion", "2024-11-05")
+            log(f"initialize (protocol {ver})")
+            self._ok(req_id, {
+                "protocolVersion": ver,
                 "capabilities": {"tools": {}},
                 "serverInfo": {
-                    "name":    SERVER_NAME,
-                    "version": "1.0.0",
+                    "name": SERVER_NAME, "version": "1.0.0",
                     "instructions": INSTRUCTIONS or (
                         f"MCP relay active. Upstream: {UPSTREAM_URL}. "
-                        "Tools are forwarded to the upstream server with auth injected automatically."
+                        "Tools forwarded with auth injected automatically."
                     ),
                 },
-            })
-            return
+            }); return
 
         if method == "notifications/initialized":
-            self.send_response(202)
-            self.end_headers()
-            return
+            self.send_response(202); self.end_headers(); return
 
         if method == "tools/list":
             tools = list(apply_hints(load_manifest())) + _SYNTHETIC_TOOLS
-            log(f"tools/list -> {len(tools)} tools ({len(tools) - len(_SYNTHETIC_TOOLS)} manifest + {len(_SYNTHETIC_TOOLS)} synthetic)")
-            self._jsonrpc(req_id, {"tools": tools})
-            return
+            log(f"tools/list -> {len(tools)} tools")
+            self._ok(req_id, {"tools": tools}); return
 
-        success, response_bytes = forward_to_upstream(raw_body, lower_headers)
+        success, resp_bytes = forward_to_upstream(raw_body, lhdrs)
         if success:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self._send_cors()
-            self.end_headers()
-            self.wfile.write(response_bytes)
+            self._cors(); self.end_headers()
+            self.wfile.write(resp_bytes)
             log(f"{method} -> upstream")
         else:
-            upstream_msg = response_bytes.decode(errors="replace").strip() if response_bytes else ""
+            upstream_msg = resp_bytes.decode(errors="replace").strip() if resp_bytes else ""
             log(f"{method} -> upstream error: {upstream_msg or '(unreachable)'}")
             if method == "tools/call":
                 tool_name = (rpc.get("params") or {}).get("name", "unknown")
-                self._raw_json(upstream_error_response(req_id, tool_name, upstream_msg))
+                self._raw(upstream_error_response(req_id, tool_name, upstream_msg))
             else:
-                self._jsonrpc(req_id, {})
+                self._ok(req_id, {})
 
-    def _jsonrpc(self, req_id, result: dict):
-        self._raw_json({"jsonrpc": "2.0", "id": req_id, "result": result})
+    def _ok(self, req_id, result):
+        self._raw({"jsonrpc": "2.0", "id": req_id, "result": result})
 
-    def _raw_json(self, data: dict):
+    def _raw(self, data):
         body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self._send_cors()
-        self.end_headers()
+        self._cors(); self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, status: int, data: dict):
+    def _json(self, status, data):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -493,10 +611,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-class QuietThreadingHTTPServer(ThreadingHTTPServer):
+class QuietServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
-        exc_type = sys.exc_info()[0]
-        if exc_type in (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        if sys.exc_info()[0] in (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
         super().handle_error(request, client_address)
 
@@ -505,9 +622,12 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if not _CONFIG_PATH.exists():
-        log(f"WARNING: config.json not found — copy config.example.json and fill in your values.")
-    elif not BEARER_TOKEN:
+    is_first_run    = not _CONFIG_PATH.exists()
+    needs_setup     = is_first_run or not _CFG.get("startup_asked", False)
+    is_tty          = sys.stdin and sys.stdin.isatty()
+
+    # Startup messages
+    if not _CFG.get("bearer_token"):
         log("WARNING: bearer_token is empty — upstream requests will be unauthenticated.")
     else:
         log("Bearer token loaded.")
@@ -516,9 +636,9 @@ if __name__ == "__main__":
         if MANIFEST_PATH.exists():
             log(f"Manifest: {len(load_manifest())} tools loaded.")
         else:
-            log(f"Manifest not found at {MANIFEST_PATH} — tools/list will be empty until the upstream server writes it.")
+            log(f"Manifest not found at {MANIFEST_PATH} — tools/list will be empty until upstream writes it.")
     else:
-        log("No manifest_path configured — tools/list served from upstream only.")
+        log("No manifest_path configured.")
 
     if _integration_status:
         log(_integration_status)
@@ -526,18 +646,22 @@ if __name__ == "__main__":
     log(f"mcp-auth-relay started — listening on http://127.0.0.1:{PROXY_PORT}/mcp")
     log(f"Forwarding to upstream at {UPSTREAM_URL}")
 
-    if not _CFG.get("integration"):
+    # First-run / startup setup
+    if needs_setup and is_tty:
+        run_setup_menu(first_run=is_first_run)
+
+    # Hint if no pack loaded and not first run (first run will get /relay-packs naturally)
+    if not _CFG.get("integration") and not needs_setup:
         print(
-            f"\n  No integration pack loaded. Type /packs to browse and install packs,\n"
-            f"  or /status for current configuration.\n",
+            f"\n  No integration pack loaded. Type /relay-packs to browse and install packs.\n",
             flush=True,
         )
 
-    # Start stdin command loop if running interactively
-    if sys.stdin and sys.stdin.isatty():
+    # Start stdin command loop
+    if is_tty:
         threading.Thread(target=_command_loop, daemon=True).start()
 
-    server = QuietThreadingHTTPServer(("127.0.0.1", PROXY_PORT), RelayHandler)
+    server = QuietServer(("127.0.0.1", PROXY_PORT), RelayHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
