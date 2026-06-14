@@ -380,6 +380,62 @@ def cmd_packs() -> None:
     status = _load_integration(name)
     print(f"  {status}", flush=True)
     print(f"  Integration active — config.json updated.\n", flush=True)
+    _run_post_install(_INTEGRATIONS_DIR / name)
+
+def _run_post_install(pack_path: pathlib.Path) -> None:
+    """Run optional post-install substeps defined in the pack's post_install.json."""
+    path = pack_path / "post_install.json"
+    if not path.exists():
+        return
+    try:
+        with open(path) as f:
+            steps = json.load(f)
+    except Exception as e:
+        print(f"  Warning: could not read post_install.json: {e}", flush=True)
+        return
+    for step in steps:
+        if step.get("type") == "mcp_server":
+            _post_install_mcp_server(step)
+
+def _post_install_mcp_server(step: dict) -> None:
+    print(f"\n  {step.get('prompt', 'Optional: add an MCP server.')}", flush=True)
+    try:
+        ans = input("\n  Add it? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+
+    if ans not in ("", "y"):
+        print("  Skipped — you can add it manually later.\n", flush=True)
+        return
+
+    target = pathlib.Path(step.get("target", "~/.claude/.mcp.json")).expanduser()
+    server_name   = step["server_name"]
+    server_config = step["server_config"]
+
+    try:
+        existing: dict = {}
+        if target.exists():
+            with open(target) as f:
+                existing = json.load(f)
+        if "servers" not in existing:
+            existing["servers"] = {}
+        if server_name in existing["servers"]:
+            print(f"  '{server_name}' is already in {target} — nothing to do.\n", flush=True)
+            return
+        existing["servers"][server_name] = server_config
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w") as f:
+            json.dump(existing, f, indent=2)
+        print(f"  Added '{server_name}' to {target}.", flush=True)
+        print(f"  Restart Claude Code for the change to take effect.\n", flush=True)
+    except Exception as e:
+        print(f"  Could not write to {target}: {e}", flush=True)
+        print(f"  Add this manually to {target} under \"servers\":\n", flush=True)
+        snippet = json.dumps({server_name: server_config}, indent=4)
+        # indent each line for readability in the terminal
+        for line in snippet.splitlines():
+            print(f"    {line}", flush=True)
+        print(flush=True)
 
 def cmd_status() -> None:
     print(f"\n  mcp-auth-relay", flush=True)
