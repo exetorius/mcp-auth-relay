@@ -1033,6 +1033,29 @@ def main():
     log(f"{len(STATE.cfg['upstreams'])} upstream(s) configured, {total_cached} tools served from cache")
     log(f"listening on http://127.0.0.1:{port}/mcp")
 
+    # First-run greeting — this is the "I just downloaded and ran it" moment.
+    # mcp-keep does nothing on its own; it is driven by an AI MCP client. Make
+    # that obvious instead of sitting silently with an empty tool list.
+    if not STATE.cfg["upstreams"]:
+        print(
+            "\n"
+            "  ──────────────────────────────────────────────────────────────\n"
+            "   mcp-keep is running — but it's a tool for an AI assistant.\n"
+            "   On its own it does nothing; an AI MCP client has to connect.\n"
+            "\n"
+            "   To use it:\n"
+            "     1. Add mcp-keep to your project's .mcp.json:\n"
+            "          \"mcp-keep\": {\n"
+            "            \"type\": \"http\",\n"
+            f"            \"url\": \"http://127.0.0.1:{port}/mcp\"\n"
+            "          }\n"
+            "     2. Open that project in your AI client (e.g. Claude) and ask\n"
+            "        it to set up mcp-keep — it will guide you from there.\n"
+            "\n"
+            "   Leave this window open; closing it stops mcp-keep.\n"
+            "  ──────────────────────────────────────────────────────────────\n",
+            flush=True)
+
     # Background capture / re-attach. Always run it — even with zero upstreams at
     # boot — so an upstream added later via keep_add_upstream gets attached.
     threading.Thread(target=capture_loop, daemon=True).start()
