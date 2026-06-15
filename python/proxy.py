@@ -377,18 +377,22 @@ def _mark(name: str, online: bool, auth_required: bool):
             st["online"] = online
             st["auth_required"] = auth_required
 
+def _safe_capture(u: dict):
+    """Capture one upstream, swallowing the expected offline/transient errors."""
+    if not u.get("name"):
+        return
+    try:
+        capture_upstream(u)
+    except (urllib.error.URLError, socket.timeout, OSError):
+        _mark(u["name"], online=False, auth_required=False)
+    except Exception as e:
+        log(f"capture error for '{u['name']}': {e}")
+
 def capture_loop():
     """Background re-attach: poll every upstream; refresh cache when reachable."""
     while True:
         for u in list(STATE.cfg["upstreams"]):
-            if not u.get("name"):
-                continue
-            try:
-                capture_upstream(u)
-            except (urllib.error.URLError, socket.timeout, OSError):
-                _mark(u["name"], online=False, auth_required=False)
-            except Exception as e:
-                log(f"capture error for '{u['name']}': {e}")
+            _safe_capture(u)
         time.sleep(max(5, int(STATE.cfg.get("capture_interval_seconds", 30))))
 
 # ---------------------------------------------------------------------------
@@ -434,13 +438,63 @@ def error_result(req_id, text: str) -> dict:
 # Management tools (chat is the UI) — exposed to the client conditionally
 # ---------------------------------------------------------------------------
 
+# Tools mcp-keep answers itself (never forwarded to an upstream). The tools/call
+# dispatcher routes any name in this set to handle_management_call().
+MANAGEMENT_TOOL_NAMES = {
+    "keep_status", "keep_install_pack", "keep_add_upstream", "keep_welcome",
+}
+
 def management_tools(state: "State") -> list[dict]:
-    tools = [{
+    tools = []
+
+    # First-run onboarding — state-gated: surfaced ONLY while no upstream is
+    # configured, and drops off the tool list once one is added. This is how a
+    # bare binary onboards itself over MCP with no repo / CLAUDE.md present.
+    # (Vanishing takes effect on the client's next tools/list fetch — see issue #6.)
+    if not state.cfg["upstreams"]:
+        tools.append({
+            "name": "keep_welcome",
+            "description": ("Onboarding guidance for mcp-keep when no upstream is configured yet. "
+                            "Call this first: it returns step-by-step instructions for setting the "
+                            "user up. Disappears once an upstream exists."),
+            "inputSchema": {"type": "object", "properties": {}, "required": []},
+        })
+
+    tools.append({
         "name": "keep_status",
         "description": ("Show mcp-keep status: configured upstreams, whether each is "
                         "currently reachable, and how many tools are cached for each."),
         "inputSchema": {"type": "object", "properties": {}, "required": []},
-    }]
+    })
+
+    # Always available: register a new upstream MCP server over the protocol —
+    # no config-file editing or filesystem access required.
+    tools.append({
+        "name": "keep_add_upstream",
+        "description": ("Register a new upstream MCP server with mcp-keep, so its tools are "
+                        "aggregated and kept surfaced even while it is offline. Only 'name' is "
+                        "required (the user's own label). Confirm the host/port/path with the "
+                        "user before calling — this writes config and adds a network upstream."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name":         {"type": "string",
+                                 "description": "Your local label for this upstream — cache key, routing handle, what keep_status shows."},
+                "host":         {"type": "string",
+                                 "description": "Upstream host. Default 127.0.0.1."},
+                "port":         {"type": "integer",
+                                 "description": "Upstream port. Default 8088."},
+                "path":         {"type": "string",
+                                 "description": "Upstream MCP path. Default /mcp."},
+                "bearer_token": {"type": "string",
+                                 "description": "Optional. Injected as 'Authorization: Bearer' for this upstream only."},
+                "integration":  {"type": "string",
+                                 "description": "Optional pack name to attach (see keep_install_pack)."},
+            },
+            "required": ["name"],
+        },
+    })
+
     # Offer pack install whenever an upstream has no integration set.
     if any(not u.get("integration") for u in state.cfg["upstreams"]) or not state.cfg["upstreams"]:
         tools.append({
@@ -462,10 +516,65 @@ def handle_management_call(req_id, tool_name: str, args: dict):
         return {"jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": text}]}}
 
+    if tool_name == "keep_welcome":
+        return ok(
+            "Welcome to mcp-keep — a lifecycle/resilience layer that fronts your MCP "
+            "server(s) on one local port and keeps their tools surfaced even while an "
+            "upstream is offline, re-attaching silently when it returns.\n\n"
+            "No upstream is configured yet. To set one up:\n"
+            "  1. Ask the user which MCP server they want to attach, and for its host, "
+            "port, and path (e.g. 127.0.0.1:8088/mcp). If they don't know, keep_install_pack "
+            "lists integration packs that often carry sensible defaults.\n"
+            "  2. Ask whether it needs auth (a bearer token). If unsure, you can add it "
+            "without one — mcp-keep auto-detects required auth by probing for a 401.\n"
+            "  3. Confirm the details back to the user, then call keep_add_upstream with "
+            "name (their label) plus host/port/path (+ bearer_token / integration if any).\n"
+            "  4. Call keep_status to confirm it attached and see its cached tool count.\n\n"
+            "Every privileged step (adding an upstream, installing a pack) must be shown to "
+            "the user and done with their consent — never silently.")
+
+    if tool_name == "keep_add_upstream":
+        a = args or {}
+        name = str(a.get("name") or "").strip()
+        if not name:
+            return error_result(req_id,
+                "keep_add_upstream needs a 'name' — the user's label for this upstream.")
+        # Reload fresh from disk so we don't clobber a concurrent change.
+        cfg = load_config()
+        if any(u.get("name") == name for u in cfg["upstreams"]):
+            return error_result(req_id,
+                f"An upstream named '{name}' already exists. Choose a different name.")
+        try:
+            port = int(a.get("port") or UPSTREAM_DEFAULTS["port"])
+        except (TypeError, ValueError):
+            return error_result(req_id, f"port must be an integer, got {a.get('port')!r}.")
+        new_u = _normalise_upstream({
+            "name":         name,
+            "host":         str(a.get("host") or UPSTREAM_DEFAULTS["host"]),
+            "port":         port,
+            "path":         str(a.get("path") or UPSTREAM_DEFAULTS["path"]),
+            "bearer_token": str(a.get("bearer_token") or ""),
+            "integration":  str(a.get("integration") or ""),
+        })
+        cfg["upstreams"].append(new_u)
+        save_config(cfg)
+        STATE.cfg = cfg
+        STATE.rebuild_from_cache()
+        # Attach immediately rather than waiting for the next capture poll.
+        threading.Thread(target=_safe_capture, args=(new_u,), daemon=True).start()
+        extra = ""
+        if new_u["bearer_token"]:
+            extra += ", auth=bearer"
+        if new_u["integration"]:
+            extra += f", pack='{new_u['integration']}'"
+        return ok(f"Added upstream '{name}' -> {upstream_url(new_u)}{extra}. "
+                  "Capturing its tools now — call keep_status in a moment to confirm.")
+
     if tool_name == "keep_status":
         lines = [f"mcp-keep — listening on 127.0.0.1:{STATE.cfg['listen_port']}"]
         if not STATE.cfg["upstreams"]:
-            lines.append("No upstreams configured. Use keep_install_pack to add one.")
+            lines.append("No upstreams configured yet. Call keep_add_upstream to register one "
+                         "(or keep_welcome for guided setup).")
         with STATE.lock:
             for name, st in STATE.upstreams.items():
                 tools = st["manifest"].get("tools", [])
@@ -666,7 +775,7 @@ class KeepHandler(BaseHTTPRequestHandler):
 
         if method == "tools/call":
             tool_name = (rpc.get("params") or {}).get("name", "")
-            if tool_name in ("keep_status", "keep_install_pack"):
+            if tool_name in MANAGEMENT_TOOL_NAMES:
                 args = (rpc.get("params") or {}).get("arguments", {})
                 self._raw(handle_management_call(req_id, tool_name, args))
                 log(f"{tool_name} -> handled by keep")
@@ -924,9 +1033,29 @@ def main():
     log(f"{len(STATE.cfg['upstreams'])} upstream(s) configured, {total_cached} tools served from cache")
     log(f"listening on http://127.0.0.1:{port}/mcp")
 
-    # Background capture / re-attach
-    if STATE.cfg["upstreams"]:
-        threading.Thread(target=capture_loop, daemon=True).start()
+    # First-run greeting — this is the "I just downloaded and ran it" moment.
+    # mcp-keep does nothing on its own; it is driven by an AI MCP client. Make
+    # that obvious instead of sitting silently with an empty tool list.
+    if not STATE.cfg["upstreams"]:
+        print(
+            "\n"
+            "  ──────────────────────────────────────────────────────────────\n"
+            "   mcp-keep is running — but it's a tool for an AI assistant.\n"
+            "   On its own it does nothing; an AI MCP client has to connect.\n"
+            "\n"
+            "   You don't need to touch any config files. Just:\n"
+            "     1. Open your AI assistant (e.g. Claude).\n"
+            "     2. Say: \"Read FIRST_TIME_SETUP.md and set up keep for me.\"\n"
+            "        (it's in the same folder as this program)\n"
+            "     Your AI will do the rest and walk you through it.\n"
+            "\n"
+            "   Leave this window open; closing it stops mcp-keep.\n"
+            "  ──────────────────────────────────────────────────────────────\n",
+            flush=True)
+
+    # Background capture / re-attach. Always run it — even with zero upstreams at
+    # boot — so an upstream added later via keep_add_upstream gets attached.
+    threading.Thread(target=capture_loop, daemon=True).start()
 
     # First-run / startup preference
     if is_tty and not STATE.cfg.get("startup_asked", False):
