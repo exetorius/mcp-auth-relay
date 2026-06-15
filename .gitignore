@@ -1,13 +1,3 @@
-# C++ build artifacts
-cpp/build/
-cpp/_deps/
-*.exe
-*.dll
-*.so
-*.dylib
-*.obj
-*.o
-
 # Python
 __pycache__/
 *.pyc
@@ -15,11 +5,20 @@ __pycache__/
 .venv/
 venv/
 
-# Config (contains secrets)
+# PyInstaller / packaged binary output (built by CI)
+build/
+dist/
+*.spec
+*.exe
+
+# Config (may contain a bearer token) — runtime config lives in ~/.mcp-keep
 config.json
 
-# Downloaded integration packs (installed via /packs — not part of core)
+# Downloaded integration packs (runtime packs live in ~/.mcp-keep/integrations)
 integrations/
+
+# Claude Code local working files (CLAUDE.md is intentionally shipped as the setup guide)
+.claude/settings.local.json
 
 # OS
 .DS_Store

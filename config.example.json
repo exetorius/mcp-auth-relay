@@ -1,10 +1,16 @@
 {
-  "bearer_token":  "",
-  "proxy_port":    8089,
-  "upstream_host": "127.0.0.1",
-  "upstream_port": 8088,
-  "manifest_path": "",
-  "integration":   "",
-  "server_name":   "mcp-auth-relay",
-  "instructions":  ""
+  "listen_port": 8089,
+  "max_body_bytes": 4194304,
+  "allowed_origins": [],
+  "capture_interval_seconds": 30,
+  "upstreams": [
+    {
+      "name": "my-server",
+      "host": "127.0.0.1",
+      "port": 8088,
+      "path": "/mcp",
+      "bearer_token": "",
+      "integration": ""
+    }
+  ]
 }

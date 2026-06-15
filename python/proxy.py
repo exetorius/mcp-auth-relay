@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """
-mcp-auth-relay
-==============
-Lightweight MCP relay with bearer token injection, manifest-based tools/list,
-integration pack support, SSE heartbeat, and first-run setup.
+mcp-keep
+========
+A lifecycle/resilience layer for MCP. It fronts one or more upstream MCP
+servers on a single local port and keeps their tools surfaced to the client
+even while an upstream is offline or not yet started — then silently
+re-attaches when it returns.
 
-Commands (type while running in a terminal):
-  /relay-setup   — startup preferences and configuration
-  /relay-packs   — browse and install integration packs
-  /relay-status  — current config and upstream health
-  /relay-reload  — reload config and integration without restart
-  /relay-quit    — stop the relay
+Core ideas (the moat):
+  - cache-when-down : the captured tool list is served from disk, so the
+                      client always sees the tools even if the backend is dead.
+  - attach-not-spawn: keep attaches to a backend it does NOT control (an
+                      editor/engine/app the user runs themselves).
+
+Everything lives under a single global home (~/.mcp-keep), outside any project.
+Projects only carry a one-line .mcp.json pointer at the master port.
+
+Terminal commands (type while running):
+  /keep-status  — current config, upstream health, cached tool counts
+  /keep-packs   — browse and install integration packs
+  /keep-setup   — startup-with-OS preference
+  /keep-reload  — reload config + integrations without restart
+  /keep-quit    — stop
 """
 
 import json
@@ -28,112 +39,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths — single global home, outside any project
 # ---------------------------------------------------------------------------
 
-_SCRIPT_PATH    = pathlib.Path(__file__).resolve()
-_CONFIG_PATH    = _SCRIPT_PATH.parent / "config.json"
-_INTEGRATIONS_DIR = _SCRIPT_PATH.parent.parent / "integrations"
-_PACKS_REPO     = "exetorius/mcp-auth-relay-integrations"
-_PACKS_BRANCH   = "main"
+KEEP_HOME        = pathlib.Path(os.environ.get("MCP_KEEP_HOME", pathlib.Path.home() / ".mcp-keep"))
+CONFIG_PATH      = KEEP_HOME / "config.json"
+INTEGRATIONS_DIR = KEEP_HOME / "integrations"
+REGISTRY_PATH    = KEEP_HOME / "registry.json"
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+PACKS_REPO   = "exetorius/mcp-keep-integrations"
+PACKS_BRANCH = "main"
 
-def _load_config() -> dict:
-    defaults = {
-        "bearer_token":       "",
-        "proxy_port":         8089,
-        "upstream_host":      "127.0.0.1",
-        "upstream_port":      8088,
-        "manifest_path":      "",
-        "integration":        "",
-        "server_name":        "mcp-auth-relay",
-        "instructions":       "",
-        "startup_asked":      False,
-        "startup_registered": False,
-    }
-    try:
-        with open(_CONFIG_PATH) as f:
-            return {**defaults, **json.load(f)}
-    except FileNotFoundError:
-        return defaults
-    except Exception as e:
-        print(f"[relay] WARNING: could not read config.json: {e}", flush=True)
-        return defaults
-
-def _save_config(updates: dict) -> None:
-    cfg = {}
-    if _CONFIG_PATH.exists():
-        try:
-            with open(_CONFIG_PATH) as f:
-                cfg = json.load(f)
-        except Exception:
-            pass
-    cfg.update(updates)
-    with open(_CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-_CFG = _load_config()
-
-PROXY_PORT    = int(_CFG["proxy_port"])
-UPSTREAM_URL  = f"http://{_CFG['upstream_host']}:{_CFG['upstream_port']}/mcp"
-BEARER_TOKEN  = _CFG["bearer_token"]
-SERVER_NAME   = _CFG["server_name"]
-INSTRUCTIONS  = _CFG["instructions"]
-MANIFEST_PATH = pathlib.Path(os.path.expandvars(_CFG["manifest_path"])) if _CFG["manifest_path"] else None
-
-# ---------------------------------------------------------------------------
-# Integration pack
-# ---------------------------------------------------------------------------
-
-_TOOL_HINTS:      dict[str, str] = {}
-_SYNTHETIC_TOOLS: list[dict]     = []
-
-def _load_integration(name: str) -> str:
-    global _TOOL_HINTS, _SYNTHETIC_TOOLS, INSTRUCTIONS
-    _TOOL_HINTS.clear()
-    _SYNTHETIC_TOOLS.clear()
-
-    if not name:
-        return ""
-
-    pack = _INTEGRATIONS_DIR / name
-    if not pack.exists():
-        return f"Integration pack '{name}' not found at {pack}"
-
-    parts = []
-
-    hints_path = pack / "hints.json"
-    if hints_path.exists():
-        try:
-            with open(hints_path) as f:
-                _TOOL_HINTS.update(json.load(f))
-            parts.append(f"{len(_TOOL_HINTS)} hints")
-        except Exception as e:
-            parts.append(f"hints ERROR: {e}")
-
-    synth_path = pack / "synthetic_tools.json"
-    if synth_path.exists():
-        try:
-            with open(synth_path) as f:
-                _SYNTHETIC_TOOLS.extend(json.load(f))
-            parts.append(f"{len(_SYNTHETIC_TOOLS)} synthetic tools")
-        except Exception as e:
-            parts.append(f"synthetic_tools ERROR: {e}")
-
-    instr_path = pack / "instructions.md"
-    if instr_path.exists() and not INSTRUCTIONS:
-        try:
-            INSTRUCTIONS = instr_path.read_text(encoding="utf-8")
-            parts.append(f"instructions ({len(INSTRUCTIONS)} bytes)")
-        except Exception as e:
-            parts.append(f"instructions ERROR: {e}")
-
-    return (f"Integration '{name}' loaded — " + ", ".join(parts)) if parts else f"Integration '{name}' loaded"
-
-_integration_status = _load_integration(_CFG.get("integration", ""))
+SERVER_NAME = "mcp-keep"
+VERSION     = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -144,698 +62,884 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 # ---------------------------------------------------------------------------
-# OS startup registration
+# Known-packs registry — shipped defaults, matched against an upstream's
+# self-reported serverInfo.name. Carries default host/port for onboarding.
+# An optional registry.json in KEEP_HOME overrides/extends these.
 # ---------------------------------------------------------------------------
 
-_OS = platform.system()  # "Windows", "Darwin", "Linux"
-
-def _relay_launch_command() -> str:
-    return f'"{sys.executable}" "{_SCRIPT_PATH}"'
-
-def register_startup() -> tuple[bool, str]:
-    if _OS == "Windows":
-        cmd = (
-            f'schtasks /Create /TN "mcp-auth-relay" '
-            f'/TR \\"{_relay_launch_command()}\\" '
-            f'/SC ONLOGON /RL HIGHEST /F'
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True)
-        if result.returncode == 0:
-            return True, "Registered via Task Scheduler — relay will start automatically at login."
-        return False, f"Task Scheduler registration failed: {result.stderr.decode().strip()}"
-
-    elif _OS == "Darwin":
-        plist_dir  = pathlib.Path.home() / "Library" / "LaunchAgents"
-        plist_path = plist_dir / "com.mcp-auth-relay.plist"
-        plist_dir.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-    <key>Label</key><string>com.mcp-auth-relay</string>
-    <key>ProgramArguments</key><array>
-        <string>{sys.executable}</string>
-        <string>{_SCRIPT_PATH}</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-</dict></plist>
-""", encoding="utf-8")
-        subprocess.run(["launchctl", "load", str(plist_path)], capture_output=True)
-        return True, "Registered via launchd — relay will start automatically at login."
-
-    else:  # Linux / systemd
-        svc_dir = pathlib.Path.home() / ".config" / "systemd" / "user"
-        svc_dir.mkdir(parents=True, exist_ok=True)
-        (svc_dir / "mcp-auth-relay.service").write_text(f"""[Unit]
-Description=mcp-auth-relay
-After=network.target
-
-[Service]
-ExecStart={sys.executable} {_SCRIPT_PATH}
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-""", encoding="utf-8")
-        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-        r = subprocess.run(["systemctl", "--user", "enable", "mcp-auth-relay"], capture_output=True)
-        if r.returncode == 0:
-            return True, "Registered via systemd user service — relay will start automatically at login."
-        return False, f"systemd registration failed: {r.stderr.decode().strip()}"
-
-
-def unregister_startup() -> tuple[bool, str]:
-    if _OS == "Windows":
-        r = subprocess.run('schtasks /Delete /TN "mcp-auth-relay" /F', shell=True, capture_output=True)
-        if r.returncode == 0:
-            return True, "Removed from Task Scheduler."
-        return False, f"Could not remove: {r.stderr.decode().strip()}"
-
-    elif _OS == "Darwin":
-        plist_path = pathlib.Path.home() / "Library" / "LaunchAgents" / "com.mcp-auth-relay.plist"
-        subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
-        plist_path.unlink(missing_ok=True)
-        return True, "Removed from launchd."
-
-    else:
-        subprocess.run(["systemctl", "--user", "disable", "mcp-auth-relay"], capture_output=True)
-        svc = pathlib.Path.home() / ".config" / "systemd" / "user" / "mcp-auth-relay.service"
-        svc.unlink(missing_ok=True)
-        return True, "Removed from systemd."
-
-# ---------------------------------------------------------------------------
-# Setup menu
-# ---------------------------------------------------------------------------
-
-def run_setup_menu(first_run: bool = False) -> None:
-    print(flush=True)
-    print("  ╔══════════════════════════════════════════╗", flush=True)
-    print("  ║          mcp-auth-relay  setup           ║", flush=True)
-    print("  ╚══════════════════════════════════════════╝", flush=True)
-    print(flush=True)
-
-    registered = _CFG.get("startup_registered", False)
-
-    if registered:
-        print("  Startup with OS: ENABLED", flush=True)
-        print(flush=True)
-        print("  1. Disable startup with OS", flush=True)
-        print("  2. Done", flush=True)
-        print(flush=True)
-        try:
-            choice = input("  Enter choice [1-2]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            choice = "2"
-
-        if choice == "1":
-            ok, msg = unregister_startup()
-            print(f"\n  {msg}", flush=True)
-            _save_config({"startup_registered": False, "startup_asked": True})
-        else:
-            print(flush=True)
-        return
-
-    print("  How would you like to start the relay?\n", flush=True)
-    print("  1. Start with OS  (recommended)", flush=True)
-    print("     Relay starts automatically at login — no manual step needed.", flush=True)
-    print(flush=True)
-    print("  2. Start manually each time", flush=True)
-    print("     Run 'python proxy.py' when you need it.", flush=True)
-    print(flush=True)
-    print("  3. Ask me next time", flush=True)
-    print("     Start now, prompt again on next launch.", flush=True)
-    print(flush=True)
-
-    try:
-        choice = input("  Enter choice [1-3]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        choice = "3"
-
-    print(flush=True)
-
-    if choice == "1":
-        ok, msg = register_startup()
-        print(f"  {msg}", flush=True)
-        if not ok:
-            print("  You may need to run as administrator and try again.", flush=True)
-        _save_config({"startup_asked": True, "startup_registered": ok})
-
-    elif choice == "2":
-        print("  Got it — starting manually. Type /relay-setup anytime to change this.", flush=True)
-        _save_config({"startup_asked": True, "startup_registered": False})
-
-    else:
-        print("  OK — will ask again next time.", flush=True)
-        _save_config({"startup_asked": False, "startup_registered": False})
-
-    print(flush=True)
-
-# ---------------------------------------------------------------------------
-# Pack installer
-# ---------------------------------------------------------------------------
-
-def _github_raw(path: str) -> str:
-    url = f"https://raw.githubusercontent.com/{_PACKS_REPO}/{_PACKS_BRANCH}/{path}"
-    req = urllib.request.Request(url, headers={"User-Agent": "mcp-auth-relay"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return r.read().decode()
-
-def _github_api(path: str) -> list | dict:
-    url = f"https://api.github.com/repos/{_PACKS_REPO}/contents/{path}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "mcp-auth-relay",
-        "Accept": "application/vnd.github+json",
-    })
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read())
-
-def _list_available_packs() -> list[str]:
-    entries = _github_api("")
-    return [e["name"] for e in entries if e["type"] == "dir" and not e["name"].startswith(".")]
-
-def _download_pack(name: str) -> tuple[bool, str]:
-    dest = _INTEGRATIONS_DIR / name
-    dest.mkdir(parents=True, exist_ok=True)
-    try:
-        files = _github_api(name)
-        downloaded = []
-        for f in files:
-            if f["type"] != "file":
-                continue
-            content = _github_raw(f"{name}/{f['name']}")
-            (dest / f["name"]).write_text(content, encoding="utf-8")
-            downloaded.append(f["name"])
-        return True, f"Downloaded {len(downloaded)} files: {', '.join(downloaded)}"
-    except Exception as e:
-        return False, str(e)
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
-def cmd_setup() -> None:
-    run_setup_menu()
-
-def cmd_packs() -> None:
-    print("\n  Fetching available packs from GitHub...", flush=True)
-    try:
-        packs = _list_available_packs()
-    except Exception as e:
-        print(f"  Could not reach GitHub: {e}", flush=True)
-        return
-
-    if not packs:
-        print("  No packs found.", flush=True)
-        return
-
-    print("\n  Available integration packs:\n", flush=True)
-    for i, name in enumerate(packs, 1):
-        installed = (_INTEGRATIONS_DIR / name).exists()
-        tag = " (installed)" if installed else ""
-        print(f"    {i}. {name}{tag}", flush=True)
-    print("    0. Cancel\n", flush=True)
-
-    try:
-        choice = input("  Select pack number: ").strip()
-        idx = int(choice)
-        if idx == 0:
-            print("  Cancelled.", flush=True)
-            return
-        if idx < 1 or idx > len(packs):
-            print("  Invalid selection.", flush=True)
-            return
-    except (ValueError, EOFError):
-        print("  Cancelled.", flush=True)
-        return
-
-    name = packs[idx - 1]
-    print(f"\n  Downloading '{name}' pack...", flush=True)
-    ok, msg = _download_pack(name)
-    if not ok:
-        print(f"  Download failed: {msg}", flush=True)
-        return
-
-    print(f"  {msg}", flush=True)
-    _save_config({"integration": name})
-    status = _load_integration(name)
-    print(f"  {status}", flush=True)
-    print(f"  Integration active — config.json updated.\n", flush=True)
-    _run_post_install(_INTEGRATIONS_DIR / name)
-
-def _run_post_install(pack_path: pathlib.Path) -> None:
-    """Run optional post-install substeps defined in the pack's post_install.json."""
-    path = pack_path / "post_install.json"
-    if not path.exists():
-        return
-    try:
-        with open(path) as f:
-            steps = json.load(f)
-    except Exception as e:
-        print(f"  Warning: could not read post_install.json: {e}", flush=True)
-        return
-    for step in steps:
-        if step.get("type") == "mcp_server":
-            _post_install_mcp_server(step)
-
-def _post_install_mcp_server(step: dict) -> None:
-    print(f"\n  {step.get('prompt', 'Optional: add an MCP server.')}", flush=True)
-    try:
-        ans = input("\n  Add it? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        ans = "n"
-
-    if ans not in ("", "y"):
-        print("  Skipped — you can add it manually later.\n", flush=True)
-        return
-
-    target = pathlib.Path(step.get("target", "~/.claude/.mcp.json")).expanduser()
-    server_name   = step["server_name"]
-    server_config = step["server_config"]
-
-    try:
-        existing: dict = {}
-        if target.exists():
-            with open(target) as f:
-                existing = json.load(f)
-        if "servers" not in existing:
-            existing["servers"] = {}
-        if server_name in existing["servers"]:
-            print(f"  '{server_name}' is already in {target} — nothing to do.\n", flush=True)
-            return
-        existing["servers"][server_name] = server_config
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "w") as f:
-            json.dump(existing, f, indent=2)
-        print(f"  Added '{server_name}' to {target}.", flush=True)
-        print(f"  Restart Claude Code for the change to take effect.\n", flush=True)
-    except Exception as e:
-        print(f"  Could not write to {target}: {e}", flush=True)
-        print(f"  Add this manually to {target} under \"servers\":\n", flush=True)
-        snippet = json.dumps({server_name: server_config}, indent=4)
-        # indent each line for readability in the terminal
-        for line in snippet.splitlines():
-            print(f"    {line}", flush=True)
-        print(flush=True)
-
-def cmd_status() -> None:
-    print(f"\n  mcp-auth-relay", flush=True)
-    print(f"  {'─' * 40}", flush=True)
-    print(f"  Listening:    http://127.0.0.1:{PROXY_PORT}/mcp", flush=True)
-    print(f"  Upstream:     {UPSTREAM_URL}", flush=True)
-    print(f"  Token:        {'set' if BEARER_TOKEN else 'NOT SET'}", flush=True)
-    print(f"  Manifest:     {MANIFEST_PATH or 'not configured'}", flush=True)
-    if MANIFEST_PATH and MANIFEST_PATH.exists():
-        print(f"  Tools:        {len(load_manifest())} from manifest + {len(_SYNTHETIC_TOOLS)} synthetic", flush=True)
-    if _INTEGRATIONS_DIR / _CFG.get('integration', ''):
-        intg = _CFG.get('integration', '')
-        if intg:
-            print(f"  Integration:  {intg} ({len(_TOOL_HINTS)} hints, {len(_SYNTHETIC_TOOLS)} synthetic tools)", flush=True)
-    else:
-        print(f"  Integration:  none — type /relay-packs to install one", flush=True)
-    reg = _CFG.get("startup_registered", False)
-    print(f"  Startup:      {'enabled' if reg else 'manual'}", flush=True)
-    print(flush=True)
-
-def cmd_reload() -> None:
-    global _CFG, BEARER_TOKEN, INSTRUCTIONS
-    _CFG = _load_config()
-    BEARER_TOKEN = _CFG["bearer_token"]
-    INSTRUCTIONS = _CFG["instructions"]
-    status = _load_integration(_CFG.get("integration", ""))
-    print(f"  Reloaded. {status or 'No integration.'}", flush=True)
-
-COMMANDS = {
-    "/relay-setup":  cmd_setup,
-    "/relay-packs":  cmd_packs,
-    "/relay-status": cmd_status,
-    "/relay-reload": cmd_reload,
+DEFAULT_REGISTRY: dict[str, dict] = {
+    # "unreal": {"host": "127.0.0.1", "port": 8088, "path": "/mcp",
+    #            "integration": "unreal", "auth": "optional"},
 }
 
-def _command_loop() -> None:
-    for line in sys.stdin:
-        cmd = line.strip().lower()
-        if not cmd:
-            continue
-        if cmd in ("/relay-quit", "/relay-exit"):
-            log("Relay stopped.")
-            os._exit(0)
-        handler = COMMANDS.get(cmd)
-        if handler:
-            handler()
-        else:
-            known = ", ".join(COMMANDS) + ", /relay-quit"
-            print(f"  Unknown command '{cmd}'. Available: {known}", flush=True)
-
-# ---------------------------------------------------------------------------
-# Manifest + hints
-# ---------------------------------------------------------------------------
-
-def load_manifest() -> list:
-    if not MANIFEST_PATH or not MANIFEST_PATH.exists():
-        return []
-    for encoding in ("utf-8-sig", "utf-16", "utf-8"):
+def load_registry() -> dict:
+    reg = dict(DEFAULT_REGISTRY)
+    if REGISTRY_PATH.exists():
         try:
-            with open(MANIFEST_PATH, encoding=encoding) as f:
-                return json.load(f)
-        except (UnicodeDecodeError, UnicodeError):
-            continue
+            reg.update(json.loads(REGISTRY_PATH.read_text(encoding="utf-8")))
         except Exception as e:
-            log(f"Warning: could not read manifest ({encoding}): {e}")
-            break
-    return []
+            log(f"WARNING: could not read registry.json: {e}")
+    return reg
 
-def apply_hints(tools: list) -> list:
+# ---------------------------------------------------------------------------
+# Configuration — a list of upstreams, driven through one master port
+# ---------------------------------------------------------------------------
+
+CONFIG_DEFAULTS = {
+    "listen_port":     8089,
+    "max_body_bytes":  4 * 1024 * 1024,   # 4 MB body cap (brick 16)
+    "allowed_origins": [],                # browser Origins allowed (brick 14); empty by default
+    "capture_interval_seconds": 30,       # re-attach poll cadence
+    "upstreams":       [],
+    "startup_asked":      False,
+    "startup_registered": False,
+}
+
+UPSTREAM_DEFAULTS = {
+    "name":         "",
+    "host":         "127.0.0.1",
+    "port":         8088,
+    "path":         "/mcp",
+    "bearer_token": "",
+    "integration":  "",
+}
+
+def _normalise_upstream(u: dict) -> dict:
+    return {**UPSTREAM_DEFAULTS, **u}
+
+def load_config() -> dict:
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return dict(CONFIG_DEFAULTS)
+    except Exception as e:
+        log(f"WARNING: could not read config.json: {e}")
+        return dict(CONFIG_DEFAULTS)
+    cfg = {**CONFIG_DEFAULTS, **raw}
+    cfg["upstreams"] = [_normalise_upstream(u) for u in cfg.get("upstreams", [])]
+    return cfg
+
+def save_config(cfg: dict) -> None:
+    KEEP_HOME.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+def upstream_url(u: dict) -> str:
+    return f"http://{u['host']}:{u['port']}{u['path']}"
+
+# ---------------------------------------------------------------------------
+# Integration packs — per upstream: hints, synthetic tools, instructions
+# ---------------------------------------------------------------------------
+
+def load_pack(name: str) -> dict:
+    """Load a pack's hints / synthetic tools / instructions. Safe if missing."""
+    pack = {"hints": {}, "synthetic_tools": [], "instructions": ""}
+    if not name:
+        return pack
+    base = INTEGRATIONS_DIR / name
+    if not base.exists():
+        return pack
+    try:
+        hp = base / "hints.json"
+        if hp.exists():
+            pack["hints"] = json.loads(hp.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(f"pack '{name}' hints error: {e}")
+    try:
+        sp = base / "synthetic_tools.json"
+        if sp.exists():
+            pack["synthetic_tools"] = json.loads(sp.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(f"pack '{name}' synthetic_tools error: {e}")
+    try:
+        ip = base / "instructions.md"
+        if ip.exists():
+            pack["instructions"] = ip.read_text(encoding="utf-8")
+    except Exception as e:
+        log(f"pack '{name}' instructions error: {e}")
+    return pack
+
+def apply_hints(tools: list, hints: dict) -> list:
+    out = []
     for tool in tools:
-        hint = _TOOL_HINTS.get(tool.get("name", ""))
+        hint = hints.get(tool.get("name", ""))
         if hint:
-            tool = dict(tool)
-            tool["description"] = tool.get("description", "") + hint
-        yield tool
+            tool = {**tool, "description": tool.get("description", "") + hint}
+        out.append(tool)
+    return out
 
 # ---------------------------------------------------------------------------
-# Upstream
+# Manifest cache — per upstream, persisted on disk. THIS is cache-when-down:
+# tools are served from here regardless of whether the upstream is reachable.
 # ---------------------------------------------------------------------------
 
-def forward_to_upstream(body_bytes: bytes, headers: dict) -> tuple[bool, bytes]:
-    fwd = {
-        "Content-Type":     "application/json",
-        "Accept":           "application/json",
-        "X-MCP-Auth-Relay": "true",
-        "Connection":       "close",
+def cache_path(upstream_name: str) -> pathlib.Path:
+    return INTEGRATIONS_DIR / upstream_name / ".cache" / "manifest.json"
+
+def load_cached_manifest(upstream_name: str) -> dict:
+    """Returns {'serverInfo': {...}, 'tools': [...]} or empty shell."""
+    p = cache_path(upstream_name)
+    if not p.exists():
+        return {"serverInfo": {}, "tools": []}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(f"cache read error for '{upstream_name}': {e}")
+        return {"serverInfo": {}, "tools": []}
+
+def save_cached_manifest(upstream_name: str, server_info: dict, tools: list) -> None:
+    p = cache_path(upstream_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "serverInfo": server_info,
+        "tools": tools,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
     }
-    if BEARER_TOKEN:
-        fwd["Authorization"] = f"Bearer {BEARER_TOKEN}"
-    for key in ("mcp-protocol-version",):
-        if key in headers:
-            fwd[key] = headers[key]
+    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    last_exc = None
+# ---------------------------------------------------------------------------
+# Runtime state — built from cache on startup, refreshed by capture loop
+# ---------------------------------------------------------------------------
+
+class State:
+    def __init__(self):
+        self.lock        = threading.Lock()
+        self.cfg         = load_config()
+        self.registry    = load_registry()
+        # per-upstream: {"manifest": {...}, "pack": {...}, "online": bool, "auth_required": bool}
+        self.upstreams: dict[str, dict] = {}
+        self.routing:   dict[str, str]  = {}   # tool name -> upstream name
+        self.rebuild_from_cache()
+
+    def rebuild_from_cache(self):
+        with self.lock:
+            self.upstreams.clear()
+            self.routing.clear()
+            for u in self.cfg["upstreams"]:
+                name = u["name"]
+                if not name:
+                    continue
+                manifest = load_cached_manifest(name)
+                pack     = load_pack(u.get("integration", ""))
+                self.upstreams[name] = {
+                    "config": u, "manifest": manifest, "pack": pack,
+                    "online": False, "auth_required": False,
+                }
+                self._index_tools(name, manifest.get("tools", []), pack)
+
+    def _index_tools(self, upstream_name: str, tools: list, pack: dict):
+        for t in tools:
+            tn = t.get("name")
+            if tn:
+                self.routing.setdefault(tn, upstream_name)
+        for t in pack.get("synthetic_tools", []):
+            tn = t.get("name")
+            if tn:
+                self.routing.setdefault(tn, upstream_name)
+
+    def aggregate_tools(self) -> list:
+        """All tools across all upstreams (cache + hints + synthetic) + management tools."""
+        out = []
+        with self.lock:
+            for name, st in self.upstreams.items():
+                tools = st["manifest"].get("tools", [])
+                out.extend(apply_hints(tools, st["pack"].get("hints", {})))
+                out.extend(st["pack"].get("synthetic_tools", []))
+        out.extend(management_tools(self))
+        return out
+
+    def aggregate_instructions(self) -> str:
+        parts = []
+        with self.lock:
+            for st in self.upstreams.values():
+                instr = st["pack"].get("instructions", "")
+                if instr:
+                    parts.append(instr)
+        return "\n\n".join(parts)
+
+    def upstream_for_tool(self, tool_name: str):
+        with self.lock:
+            name = self.routing.get(tool_name)
+            if name is None and len(self.cfg["upstreams"]) == 1:
+                name = self.cfg["upstreams"][0]["name"]   # lenient single-upstream fallback
+            if name is None:
+                return None
+            return self.upstreams.get(name, {}).get("config")
+
+STATE: "State" = None  # set in main / on demand
+
+# ---------------------------------------------------------------------------
+# Upstream capture — initialize handshake + tools/list, learn identity.
+# Runs in the background; updates the on-disk cache when reachable.
+# ---------------------------------------------------------------------------
+
+def _post_mcp(url: str, payload: dict, bearer: str, session_id: str = ""):
+    """POST a JSON-RPC message to an MCP HTTP server. Returns (status, headers, obj)."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-MCP-Keep": "true",
+    }
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    if session_id:
+        headers["mcp-session-id"] = session_id
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            ctype = resp.headers.get("Content-Type", "")
+            sid = resp.headers.get("mcp-session-id", session_id)
+            return resp.status, {"mcp-session-id": sid, "content-type": ctype}, _parse_mcp_body(raw, ctype)
+    except urllib.error.HTTPError as e:
+        return e.code, {}, None
+
+def _parse_mcp_body(raw: bytes, content_type: str):
+    """Handle both plain JSON and SSE (text/event-stream) responses."""
+    text = raw.decode("utf-8", errors="replace").strip()
+    if "text/event-stream" in content_type:
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                chunk = line[5:].strip()
+                try:
+                    return json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+def capture_upstream(u: dict) -> bool:
+    """Connect, handshake, capture tools/list -> cache. Returns True if captured."""
+    url = upstream_url(u)
+    name = u["name"]
+    bearer = u.get("bearer_token", "")
+    auth_required = False
+
+    init_payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-keep", "version": VERSION},
+        },
+    }
+
+    status, hdrs, obj = _post_mcp(url, init_payload, "")
+    if status == 401:                       # auth probe (brick 7)
+        auth_required = True
+        if not bearer:
+            _mark(name, online=False, auth_required=True)
+            return False
+        status, hdrs, obj = _post_mcp(url, init_payload, bearer)
+
+    if status >= 400 or obj is None:
+        _mark(name, online=False, auth_required=auth_required)
+        return False
+
+    session_id  = hdrs.get("mcp-session-id", "")
+    server_info = (obj.get("result") or {}).get("serverInfo", {})
+
+    # politely complete the handshake
+    _post_mcp(url, {"jsonrpc": "2.0", "method": "notifications/initialized"},
+              bearer if auth_required else "", session_id)
+
+    status, hdrs, obj = _post_mcp(
+        url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        bearer if auth_required else "", session_id)
+    if status >= 400 or obj is None:
+        _mark(name, online=False, auth_required=auth_required)
+        return False
+
+    tools = (obj.get("result") or {}).get("tools", [])
+    save_cached_manifest(name, server_info, tools)
+
+    with STATE.lock:
+        st = STATE.upstreams.get(name)
+        if st is not None:
+            st["manifest"] = {"serverInfo": server_info, "tools": tools}
+            st["online"] = True
+            st["auth_required"] = auth_required
+            STATE._index_tools(name, tools, st["pack"])
+
+    identity = server_info.get("name", "?")
+    log(f"captured '{name}' (identity='{identity}', {len(tools)} tools, "
+        f"auth={'required' if auth_required else 'none'})")
+    return True
+
+def _mark(name: str, online: bool, auth_required: bool):
+    with STATE.lock:
+        st = STATE.upstreams.get(name)
+        if st is not None:
+            st["online"] = online
+            st["auth_required"] = auth_required
+
+def capture_loop():
+    """Background re-attach: poll every upstream; refresh cache when reachable."""
+    while True:
+        for u in list(STATE.cfg["upstreams"]):
+            if not u.get("name"):
+                continue
+            try:
+                capture_upstream(u)
+            except (urllib.error.URLError, socket.timeout, OSError):
+                _mark(u["name"], online=False, auth_required=False)
+            except Exception as e:
+                log(f"capture error for '{u['name']}': {e}")
+        time.sleep(max(5, int(STATE.cfg.get("capture_interval_seconds", 30))))
+
+# ---------------------------------------------------------------------------
+# tools/call forwarding — route to the owning upstream, inject its bearer
+# ---------------------------------------------------------------------------
+
+def forward_call(u: dict, body_bytes: bytes, client_headers: dict) -> tuple[bool, bytes]:
+    url = upstream_url(u)
+    fwd = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-MCP-Keep": "true",
+        "Connection": "close",
+    }
+    if u.get("bearer_token"):
+        fwd["Authorization"] = f"Bearer {u['bearer_token']}"
+    for k in ("mcp-protocol-version", "mcp-session-id"):
+        if k in client_headers:
+            fwd[k] = client_headers[k]
+
+    last = None
     for attempt in range(2):
         try:
-            req = urllib.request.Request(UPSTREAM_URL, data=body_bytes, headers=fwd, method="POST")
+            req = urllib.request.Request(url, data=body_bytes, headers=fwd, method="POST")
             with urllib.request.urlopen(req, timeout=120) as resp:
                 return True, resp.read()
         except urllib.error.HTTPError as e:
             body = e.read()
-            log(f"Upstream returned HTTP {e.code}: {body[:200]}")
+            log(f"upstream '{u['name']}' HTTP {e.code}: {body[:200]}")
             return False, body
         except (urllib.error.URLError, socket.timeout, OSError) as exc:
-            last_exc = exc
+            last = exc
             if attempt == 0:
-                log(f"Connection error (attempt {attempt+1}), retrying: {exc}")
-    log(f"Upstream unreachable after 2 attempts: {last_exc}")
+                log(f"'{u['name']}' connection error, retrying: {exc}")
+    log(f"'{u['name']}' unreachable: {last}")
     return False, b""
 
-def upstream_error_response(req_id, tool_name: str, msg: str = "") -> dict:
-    text = (
-        f"Upstream server rejected the request: {msg}\n"
-        f"Check that bearer_token in config.json matches the upstream server's expected token."
-        if msg else
-        f"Upstream server is not running.\nPlease start your MCP server, then retry '{tool_name}'."
-    )
+def error_result(req_id, text: str) -> dict:
     return {"jsonrpc": "2.0", "id": req_id,
             "result": {"content": [{"type": "text", "text": text}], "isError": True}}
 
 # ---------------------------------------------------------------------------
-# Conditional setup tools — shown only when relay is not yet configured
+# Management tools (chat is the UI) — exposed to the client conditionally
 # ---------------------------------------------------------------------------
 
-def _get_setup_tools() -> list[dict]:
-    """Return relay-level setup tools based on current config state.
-    Removed from tools/list once the relevant config is in place."""
-    tools = []
-    if not _CFG.get("integration"):
+def management_tools(state: "State") -> list[dict]:
+    tools = [{
+        "name": "keep_status",
+        "description": ("Show mcp-keep status: configured upstreams, whether each is "
+                        "currently reachable, and how many tools are cached for each."),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    }]
+    # Offer pack install whenever an upstream has no integration set.
+    if any(not u.get("integration") for u in state.cfg["upstreams"]) or not state.cfg["upstreams"]:
         tools.append({
-            "name": "relay_install_pack",
-            "description": (
-                "Install an integration pack for this MCP relay. "
-                "Call with no arguments to list available packs, or with name='<pack>' to install one. "
-                "Packs add tool hints, synthetic tools, and agent instructions tailored to your upstream MCP server. "
-                "This tool disappears once a pack is installed."
-            ),
+            "name": "keep_install_pack",
+            "description": ("Install an integration pack. Call with no arguments to list "
+                            "available packs, or name='<pack>' to install one. Packs add tool "
+                            "hints, synthetic tools, and agent instructions for an upstream."),
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Pack name to install. Omit to list available packs."}
-                },
-                "required": []
-            }
+                "properties": {"name": {"type": "string",
+                               "description": "Pack to install. Omit to list available packs."}},
+                "required": [],
+            },
         })
     return tools
 
-
-def handle_relay_install_pack(req_id, pack_name: str) -> dict:
+def handle_management_call(req_id, tool_name: str, args: dict):
     def ok(text):
         return {"jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": text}]}}
-    def err(text):
-        return {"jsonrpc": "2.0", "id": req_id,
-                "result": {"content": [{"type": "text", "text": text}], "isError": True}}
 
-    if not pack_name:
-        try:
-            packs = _list_available_packs()
-            text = "Available integration packs:\n" + "\n".join(f"  - {p}" for p in packs)
-            text += "\n\nCall relay_install_pack with name='<pack>' to install one."
-            return ok(text)
-        except Exception as e:
-            return err(f"Could not reach GitHub: {e}")
+    if tool_name == "keep_status":
+        lines = [f"mcp-keep — listening on 127.0.0.1:{STATE.cfg['listen_port']}"]
+        if not STATE.cfg["upstreams"]:
+            lines.append("No upstreams configured. Use keep_install_pack to add one.")
+        with STATE.lock:
+            for name, st in STATE.upstreams.items():
+                tools = st["manifest"].get("tools", [])
+                ident = st["manifest"].get("serverInfo", {}).get("name", "?")
+                state_str = "online" if st["online"] else "OFFLINE (serving cache)"
+                lines.append(f"  • {name}: {state_str}, identity='{ident}', "
+                             f"{len(tools)} cached tools, "
+                             f"auth={'required' if st['auth_required'] else 'none'}")
+        return ok("\n".join(lines))
 
-    success, msg = _download_pack(pack_name)
-    if not success:
-        return err(f"Download failed: {msg}")
+    if tool_name == "keep_install_pack":
+        pack_name = (args or {}).get("name", "")
+        if not pack_name:
+            try:
+                packs = list_available_packs()
+                return ok("Available packs:\n" + "\n".join(f"  - {p}" for p in packs) +
+                          "\n\nCall keep_install_pack with name='<pack>' to install.")
+            except Exception as e:
+                return error_result(req_id, f"Could not reach GitHub: {e}")
+        success, msg = download_pack(pack_name)
+        if not success:
+            return error_result(req_id, f"Download failed: {msg}")
+        post = run_post_install(INTEGRATIONS_DIR / pack_name)
+        STATE.cfg = load_config()
+        STATE.rebuild_from_cache()
+        text = f"{msg}"
+        if post:
+            text += f"\n\n{post}"
+        return ok(text)
 
-    _save_config({"integration": pack_name})
-    status = _load_integration(pack_name)
+    return error_result(req_id, f"Unknown management tool '{tool_name}'.")
 
-    post_result = _run_post_install_mcp(_INTEGRATIONS_DIR / pack_name)
-    text = f"{msg}\n{status}"
-    if post_result:
-        text += f"\n\n{post_result}"
-    return ok(text)
+# ---------------------------------------------------------------------------
+# Pack download (salvaged, repointed to mcp-keep-integrations)
+# ---------------------------------------------------------------------------
 
+def _gh_raw(path: str) -> str:
+    url = f"https://raw.githubusercontent.com/{PACKS_REPO}/{PACKS_BRANCH}/{path}"
+    req = urllib.request.Request(url, headers={"User-Agent": "mcp-keep"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read().decode()
 
-def _run_post_install_mcp(pack_path: pathlib.Path) -> str:
-    """Process post_install.json non-interactively (MCP tool context, no prompts)."""
+def _gh_api(path: str):
+    url = f"https://api.github.com/repos/{PACKS_REPO}/contents/{path}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "mcp-keep", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+def list_available_packs() -> list[str]:
+    return [e["name"] for e in _gh_api("") if e["type"] == "dir" and not e["name"].startswith(".")]
+
+def download_pack(name: str) -> tuple[bool, str]:
+    dest = INTEGRATIONS_DIR / name
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        files = _gh_api(name)
+        got = []
+        for f in files:
+            if f["type"] != "file":
+                continue
+            (dest / f["name"]).write_text(_gh_raw(f"{name}/{f['name']}"), encoding="utf-8")
+            got.append(f["name"])
+        return True, f"Downloaded pack '{name}' ({len(got)} files): {', '.join(got)}"
+    except Exception as e:
+        return False, str(e)
+
+def run_post_install(pack_path: pathlib.Path) -> str:
+    """Process post_install.json non-interactively (mcp_server merge into .mcp.json)."""
     path = pack_path / "post_install.json"
     if not path.exists():
         return ""
     try:
-        with open(path) as f:
-            steps = json.load(f)
+        steps = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         return f"Warning: could not read post_install.json: {e}"
     results = []
     for step in steps:
         if step.get("type") == "mcp_server":
-            results.append(_post_install_mcp_server_silent(step))
+            results.append(_merge_mcp_server(step))
     return "\n".join(r for r in results if r)
 
-
-def _post_install_mcp_server_silent(step: dict) -> str:
+def _merge_mcp_server(step: dict) -> str:
     server_name   = step["server_name"]
     server_config = step["server_config"]
     target = pathlib.Path(step.get("target", "~/.claude/.mcp.json")).expanduser()
     try:
-        existing: dict = {}
-        if target.exists():
-            with open(target) as f:
-                existing = json.load(f)
-        if "servers" not in existing:
-            existing["servers"] = {}
+        existing = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+        existing.setdefault("servers", {})
         if server_name in existing["servers"]:
-            return f"'{server_name}' is already configured in {target}."
+            return f"'{server_name}' already configured in {target}."
         existing["servers"][server_name] = server_config
         target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "w") as f:
-            json.dump(existing, f, indent=2)
-        return f"Added '{server_name}' to {target}. Restart Claude Code for the change to take effect."
+        target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        return f"Added '{server_name}' to {target}. Restart Claude Code to pick it up."
     except Exception as e:
-        snippet = json.dumps({server_name: server_config}, indent=4)
-        return (
-            f"Could not write to {target}: {e}\n"
-            f"Add this manually to {target} under \"servers\":\n\n"
-            + "\n".join(f"  {line}" for line in snippet.splitlines())
-        )
+        snippet = json.dumps({server_name: server_config}, indent=2)
+        return (f"Could not write to {target}: {e}\nAdd this manually under \"servers\":\n{snippet}")
 
+# ---------------------------------------------------------------------------
+# Security gates — always-on, zero-config (bricks 14, 15, 16)
+# ---------------------------------------------------------------------------
+
+def check_origin(headers: dict) -> bool:
+    """Reject a present Origin not in the allowlist. Missing Origin = trusted client."""
+    origin = headers.get("origin")
+    if origin is None:
+        return True
+    return origin in STATE.cfg.get("allowed_origins", [])
+
+def check_host(headers: dict) -> bool:
+    """Reject any Host that isn't loopback (DNS-rebinding defence)."""
+    host = (headers.get("host") or "").strip()
+    if not host:
+        return False
+    hostname = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    return hostname in ("127.0.0.1", "localhost", "[::1]", "::1")
 
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
-class RelayHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args): pass
+class KeepHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # silence default logging
+        pass
 
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, MCP-Protocol-Version, mcp-session-id")
-
-    def do_OPTIONS(self):
-        self.send_response(200); self._cors(); self.end_headers()
+    # -- security on every request --------------------------------------
+    def _gate(self) -> bool:
+        h = {k.lower(): v for k, v in self.headers.items()}
+        if not check_host(h):
+            self._text(403, "forbidden: host not allowed"); return False
+        if not check_origin(h):
+            self._text(403, "forbidden: origin not allowed"); return False
+        return True
 
     def do_GET(self):
-        if "text/event-stream" not in self.headers.get("Accept", ""):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self._cors(); self.end_headers()
-            self.wfile.write(b"mcp-auth-relay running")
+        if not self._gate():
             return
-        log("SSE stream opened")
+        if "text/event-stream" not in self.headers.get("Accept", ""):
+            self._text(200, "mcp-keep running"); return
+        # SSE heartbeat — keeps the client from reconnecting in a tight loop
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self._cors(); self.end_headers()
+        self.end_headers()
         try:
             while True:
                 self.wfile.write(b": heartbeat\n\n")
                 self.wfile.flush()
                 time.sleep(15)
         except (BrokenPipeError, ConnectionResetError, OSError):
-            log("SSE stream closed")
+            pass
 
     def do_POST(self):
+        if not self._gate():
+            return
         if self.path != "/mcp":
-            self.send_response(404); self.end_headers(); return
+            self._text(404, "not found"); return
 
-        length   = int(self.headers.get("Content-Length", 0))
-        raw_body = self.rfile.read(length)
-        lhdrs    = {k.lower(): v for k, v in self.headers.items()}
+        length = int(self.headers.get("Content-Length", 0))
+        cap = int(STATE.cfg.get("max_body_bytes", CONFIG_DEFAULTS["max_body_bytes"]))
+        if length > cap:
+            self._text(413, f"payload too large (max {cap} bytes)"); return
+
+        raw = self.rfile.read(length)
+        client_headers = {k.lower(): v for k, v in self.headers.items()}
 
         try:
-            rpc = json.loads(raw_body)
+            rpc = json.loads(raw)
         except json.JSONDecodeError:
-            self._json(400, {"error": "Invalid JSON"}); return
+            self._json(400, {"error": "invalid JSON"}); return
 
         method = rpc.get("method", "")
         req_id = rpc.get("id")
 
         if method == "initialize":
             ver = (rpc.get("params") or {}).get("protocolVersion", "2024-11-05")
-            log(f"initialize (protocol {ver})")
-            self._ok(req_id, {
+            instr = STATE.aggregate_instructions() or (
+                "mcp-keep active. Tools stay surfaced even while an upstream is offline.")
+            self._result(req_id, {
                 "protocolVersion": ver,
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": SERVER_NAME, "version": "1.0.0",
-                    "instructions": INSTRUCTIONS or (
-                        f"MCP relay active. Upstream: {UPSTREAM_URL}. "
-                        "Tools forwarded with auth injected automatically."
-                    ),
-                },
-            }); return
+                "capabilities": {"tools": {"listChanged": True}},
+                "serverInfo": {"name": SERVER_NAME, "version": VERSION},
+                "instructions": instr,
+            })
+            log(f"initialize (protocol {ver})")
+            return
 
         if method == "notifications/initialized":
             self.send_response(202); self.end_headers(); return
 
         if method == "tools/list":
-            tools = list(apply_hints(load_manifest())) + _SYNTHETIC_TOOLS + _get_setup_tools()
+            tools = STATE.aggregate_tools()
+            self._result(req_id, {"tools": tools})
             log(f"tools/list -> {len(tools)} tools")
-            self._ok(req_id, {"tools": tools}); return
+            return
 
         if method == "tools/call":
             tool_name = (rpc.get("params") or {}).get("name", "")
-            if tool_name == "relay_install_pack":
+            if tool_name in ("keep_status", "keep_install_pack"):
                 args = (rpc.get("params") or {}).get("arguments", {})
-                pack_name = args.get("name", "")
-                log(f"relay_install_pack('{pack_name}') -> handled by relay")
-                self._raw(handle_relay_install_pack(req_id, pack_name))
+                self._raw(handle_management_call(req_id, tool_name, args))
+                log(f"{tool_name} -> handled by keep")
                 return
-
-        success, resp_bytes = forward_to_upstream(raw_body, lhdrs)
-        if success:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self._cors(); self.end_headers()
-            self.wfile.write(resp_bytes)
-            log(f"{method} -> upstream")
-        else:
-            upstream_msg = resp_bytes.decode(errors="replace").strip() if resp_bytes else ""
-            log(f"{method} -> upstream error: {upstream_msg or '(unreachable)'}")
-            if method == "tools/call":
-                tool_name = (rpc.get("params") or {}).get("name", "unknown")
-                self._raw(upstream_error_response(req_id, tool_name, upstream_msg))
+            u = STATE.upstream_for_tool(tool_name)
+            if u is None:
+                self._raw(error_result(req_id,
+                    f"No upstream knows the tool '{tool_name}'."))
+                return
+            success, resp = forward_call(u, raw, client_headers)
+            if success:
+                self._passthrough(resp)
+                log(f"tools/call '{tool_name}' -> '{u['name']}'")
             else:
-                self._ok(req_id, {})
+                msg = resp.decode(errors="replace").strip() if resp else ""
+                detail = (f"Upstream '{u['name']}' rejected the call: {msg}"
+                          if msg else
+                          f"Upstream '{u['name']}' is not running. Start it, then retry '{tool_name}'.")
+                self._raw(error_result(req_id, detail))
+                log(f"tools/call '{tool_name}' -> '{u['name']}' FAILED")
+            return
 
-    def _ok(self, req_id, result):
+        # any other method: best-effort forward to the single upstream, else empty
+        if len(STATE.cfg["upstreams"]) == 1:
+            success, resp = forward_call(STATE.cfg["upstreams"][0], raw, client_headers)
+            if success:
+                self._passthrough(resp); return
+        self._result(req_id, {})
+
+    # -- response helpers -----------------------------------------------
+    def _result(self, req_id, result):
         self._raw({"jsonrpc": "2.0", "id": req_id, "result": result})
 
-    def _raw(self, data):
-        body = json.dumps(data).encode()
+    def _raw(self, obj):
+        body = json.dumps(obj).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self._cors(); self.end_headers()
+        self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, status, data):
-        body = json.dumps(data).encode()
+    def _passthrough(self, body: bytes):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, status, obj):
+        body = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _text(self, status, msg):
+        body = msg.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 class QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
     def handle_error(self, request, client_address):
         if sys.exc_info()[0] in (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
         super().handle_error(request, client_address)
 
 # ---------------------------------------------------------------------------
+# OS startup registration (salvaged, renamed to mcp-keep)
+# ---------------------------------------------------------------------------
+
+_OS = platform.system()
+
+def _launch_command() -> str:
+    return f'"{sys.executable}" "{pathlib.Path(__file__).resolve()}"'
+
+def register_startup() -> tuple[bool, str]:
+    if _OS == "Windows":
+        cmd = (f'schtasks /Create /TN "mcp-keep" /TR \\"{_launch_command()}\\" '
+               f'/SC ONLOGON /RL HIGHEST /F')
+        r = subprocess.run(cmd, shell=True, capture_output=True)
+        if r.returncode == 0:
+            return True, "Registered via Task Scheduler — keep starts at login."
+        return False, f"Task Scheduler failed: {r.stderr.decode().strip()}"
+    elif _OS == "Darwin":
+        d = pathlib.Path.home() / "Library" / "LaunchAgents"
+        d.mkdir(parents=True, exist_ok=True)
+        plist = d / "com.mcp-keep.plist"
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.mcp-keep</string>
+    <key>ProgramArguments</key><array>
+        <string>{sys.executable}</string>
+        <string>{pathlib.Path(__file__).resolve()}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+</dict></plist>
+""", encoding="utf-8")
+        subprocess.run(["launchctl", "load", str(plist)], capture_output=True)
+        return True, "Registered via launchd — keep starts at login."
+    else:
+        d = pathlib.Path.home() / ".config" / "systemd" / "user"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "mcp-keep.service").write_text(f"""[Unit]
+Description=mcp-keep
+After=network.target
+
+[Service]
+ExecStart={sys.executable} {pathlib.Path(__file__).resolve()}
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+""", encoding="utf-8")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        r = subprocess.run(["systemctl", "--user", "enable", "mcp-keep"], capture_output=True)
+        if r.returncode == 0:
+            return True, "Registered via systemd user service — keep starts at login."
+        return False, f"systemd failed: {r.stderr.decode().strip()}"
+
+def unregister_startup() -> tuple[bool, str]:
+    if _OS == "Windows":
+        r = subprocess.run('schtasks /Delete /TN "mcp-keep" /F', shell=True, capture_output=True)
+        return (r.returncode == 0), ("Removed from Task Scheduler." if r.returncode == 0
+                                     else f"Could not remove: {r.stderr.decode().strip()}")
+    elif _OS == "Darwin":
+        plist = pathlib.Path.home() / "Library" / "LaunchAgents" / "com.mcp-keep.plist"
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+        plist.unlink(missing_ok=True)
+        return True, "Removed from launchd."
+    else:
+        subprocess.run(["systemctl", "--user", "disable", "mcp-keep"], capture_output=True)
+        (pathlib.Path.home() / ".config" / "systemd" / "user" / "mcp-keep.service").unlink(missing_ok=True)
+        return True, "Removed from systemd."
+
+# ---------------------------------------------------------------------------
+# Terminal command loop + startup menu
+# ---------------------------------------------------------------------------
+
+def cmd_status():
+    print(handle_management_call(0, "keep_status", {})["result"]["content"][0]["text"], flush=True)
+
+def cmd_packs():
+    print("\n  Fetching packs from GitHub...", flush=True)
+    try:
+        packs = list_available_packs()
+    except Exception as e:
+        print(f"  Could not reach GitHub: {e}", flush=True); return
+    if not packs:
+        print("  No packs found.", flush=True); return
+    for i, name in enumerate(packs, 1):
+        installed = (INTEGRATIONS_DIR / name).exists()
+        print(f"    {i}. {name}{' (installed)' if installed else ''}", flush=True)
+    print("    0. Cancel", flush=True)
+    try:
+        idx = int(input("  Select pack: ").strip())
+    except (ValueError, EOFError):
+        print("  Cancelled.", flush=True); return
+    if idx <= 0 or idx > len(packs):
+        print("  Cancelled.", flush=True); return
+    name = packs[idx - 1]
+    ok, msg = download_pack(name)
+    print(f"  {msg}", flush=True)
+    if ok:
+        post = run_post_install(INTEGRATIONS_DIR / name)
+        if post:
+            print(f"  {post}", flush=True)
+        STATE.cfg = load_config(); STATE.rebuild_from_cache()
+
+def cmd_reload():
+    STATE.cfg = load_config()
+    STATE.registry = load_registry()
+    STATE.rebuild_from_cache()
+    print("  Reloaded config + integrations.", flush=True)
+
+def run_setup_menu():
+    print("\n  mcp-keep — start with your OS?\n", flush=True)
+    if STATE.cfg.get("startup_registered"):
+        print("  Currently: ENABLED.  1) Disable   2) Keep enabled", flush=True)
+        try:
+            choice = input("  Choice [1-2]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "2"
+        if choice == "1":
+            _, msg = unregister_startup()
+            print(f"  {msg}", flush=True)
+            STATE.cfg["startup_registered"] = False
+        STATE.cfg["startup_asked"] = True
+        save_config(STATE.cfg); return
+
+    print("  1) Start with OS (recommended)\n  2) Start manually each time\n  3) Ask next time", flush=True)
+    try:
+        choice = input("  Choice [1-3]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = "3"
+    if choice == "1":
+        ok, msg = register_startup()
+        print(f"  {msg}", flush=True)
+        STATE.cfg["startup_registered"] = ok
+        STATE.cfg["startup_asked"] = True
+    elif choice == "2":
+        STATE.cfg["startup_registered"] = False
+        STATE.cfg["startup_asked"] = True
+    else:
+        STATE.cfg["startup_asked"] = False
+    save_config(STATE.cfg)
+
+COMMANDS = {
+    "/keep-status": cmd_status,
+    "/keep-packs":  cmd_packs,
+    "/keep-setup":  run_setup_menu,
+    "/keep-reload": cmd_reload,
+}
+
+def command_loop():
+    for line in sys.stdin:
+        cmd = line.strip().lower()
+        if not cmd:
+            continue
+        if cmd in ("/keep-quit", "/keep-exit"):
+            log("keep stopped."); os._exit(0)
+        handler = COMMANDS.get(cmd)
+        if handler:
+            handler()
+        else:
+            print(f"  Unknown '{cmd}'. Available: {', '.join(COMMANDS)}, /keep-quit", flush=True)
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    is_first_run    = not _CONFIG_PATH.exists()
-    needs_setup     = is_first_run or not _CFG.get("startup_asked", False)
-    is_tty          = sys.stdin and sys.stdin.isatty()
+def main():
+    global STATE
+    try:                                  # keep em-dash / bullet output sane on Windows consoles
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    KEEP_HOME.mkdir(parents=True, exist_ok=True)
+    INTEGRATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    STATE = State()
 
-    # Startup messages
-    if not _CFG.get("bearer_token"):
-        log("WARNING: bearer_token is empty — upstream requests will be unauthenticated.")
-    else:
-        log("Bearer token loaded.")
+    port = int(STATE.cfg["listen_port"])
+    is_tty = bool(sys.stdin and sys.stdin.isatty())
 
-    if MANIFEST_PATH:
-        if MANIFEST_PATH.exists():
-            log(f"Manifest: {len(load_manifest())} tools loaded.")
-        else:
-            log(f"Manifest not found at {MANIFEST_PATH} — tools/list will be empty until upstream writes it.")
-    else:
-        log("No manifest_path configured.")
+    # Report what we loaded from cache (the moat: tools available before any capture)
+    total_cached = sum(len(st["manifest"].get("tools", [])) for st in STATE.upstreams.values())
+    log(f"mcp-keep {VERSION} — home {KEEP_HOME}")
+    log(f"{len(STATE.cfg['upstreams'])} upstream(s) configured, {total_cached} tools served from cache")
+    log(f"listening on http://127.0.0.1:{port}/mcp")
 
-    if _integration_status:
-        log(_integration_status)
+    # Background capture / re-attach
+    if STATE.cfg["upstreams"]:
+        threading.Thread(target=capture_loop, daemon=True).start()
 
-    log(f"mcp-auth-relay started — listening on http://127.0.0.1:{PROXY_PORT}/mcp")
-    log(f"Forwarding to upstream at {UPSTREAM_URL}")
+    # First-run / startup preference
+    if is_tty and not STATE.cfg.get("startup_asked", False):
+        run_setup_menu()
 
-    # First-run / startup setup
-    if needs_setup and is_tty:
-        run_setup_menu(first_run=is_first_run)
-
-    # Pack prompt — offer immediately if no integration is configured
-    if is_tty and not _CFG.get("integration"):
-        print("\n  No integration pack loaded.", flush=True)
-        try:
-            ans = input("  Download one now? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "n"
-        if ans in ("", "y"):
-            cmd_packs()
-        else:
-            print("  OK — type /relay-packs anytime to install one.\n", flush=True)
-
-    # Start stdin command loop
     if is_tty:
-        threading.Thread(target=_command_loop, daemon=True).start()
+        threading.Thread(target=command_loop, daemon=True).start()
 
-    server = QuietServer(("127.0.0.1", PROXY_PORT), RelayHandler)
+    server = QuietServer(("127.0.0.1", port), KeepHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log("Relay stopped.")
+        log("keep stopped.")
+
+if __name__ == "__main__":
+    main()
