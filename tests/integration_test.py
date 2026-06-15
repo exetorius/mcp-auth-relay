@@ -75,15 +75,38 @@ def main() -> int:
     env = dict(os.environ, MCP_KEEP_HOME=home)
     relay = subprocess.Popen([sys.executable, str(PROXY)], env=env,
                              stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT)
-    time.sleep(3)  # let it bind
+
+    # Talk to the relay directly — never via a proxy. Some CI runner images (notably
+    # macOS) set http_proxy/HTTP_PROXY, and urllib honors it by default, which would
+    # route our 127.0.0.1 calls through a proxy and hang. An empty ProxyHandler
+    # disables that for this opener.
+    base = f"http://127.0.0.1:{RELAY_PORT}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def rpc(method, params=None, rid=1, timeout=15):
         body = json.dumps({"jsonrpc": "2.0", "id": rid,
                            "method": method, "params": params or {}}).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{RELAY_PORT}/mcp",
-                                     data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        req = urllib.request.Request(f"{base}/mcp", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read())
+
+    # Readiness poll — wait for the relay to actually serve before asserting,
+    # instead of a fixed sleep (slow runners would otherwise race startup).
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            with opener.open(f"{base}/mcp", timeout=3) as r:
+                if r.status == 200:
+                    break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        log_file.flush()
+        print("relay did not become ready within 30s", flush=True)
+        print(log_path.read_text(encoding="utf-8", errors="replace"), flush=True)
+        relay.terminate()
+        return 1
 
     def tool_names():
         return [t["name"] for t in rpc("tools/list")["result"]["tools"]]
