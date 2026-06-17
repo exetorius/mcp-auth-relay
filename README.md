@@ -58,11 +58,11 @@ Grab the build for your OS from the [latest release](https://github.com/exetoriu
 
 | OS | Download |
 |----|----------|
-| Windows | [`mcp-keep-windows-x86_64.exe`](https://github.com/exetorius/mcp-keep/releases/latest/download/mcp-keep-windows-x86_64.exe) |
-| macOS (Apple Silicon) | [`mcp-keep-macos-arm64`](https://github.com/exetorius/mcp-keep/releases/latest/download/mcp-keep-macos-arm64) |
-| Linux (x86-64) | [`mcp-keep-linux-x86_64`](https://github.com/exetorius/mcp-keep/releases/latest/download/mcp-keep-linux-x86_64) |
+| Windows | [`mcp-keep-windows-x86_64.zip`](https://github.com/exetorius/mcp-keep/releases/latest/download/mcp-keep-windows-x86_64.zip) |
+| macOS (Apple Silicon) | [`mcp-keep-macos-arm64.zip`](https://github.com/exetorius/mcp-keep/releases/latest/download/mcp-keep-macos-arm64.zip) |
+| Linux (x86-64) | [`mcp-keep-linux-x86_64.zip`](https://github.com/exetorius/mcp-keep/releases/latest/download/mcp-keep-linux-x86_64.zip) |
 
-On macOS/Linux, mark it executable first (`chmod +x mcp-keep-*`), then run it. On Windows, just run the `.exe`.
+Unzip it — you'll get a `mcp-keep/` folder holding the `mcp-keep` binary, its `_internal/` runtime, and `FIRST_TIME_SETUP.md`. Run the binary from inside that folder. On macOS/Linux, mark it executable first (`chmod +x mcp-keep/mcp-keep`); on Windows, just run `mcp-keep.exe`.
 
 `mcp-keep` is **AI-driven — it does nothing on its own**; an MCP client connects and drives it. The fastest path: run the binary, then tell your assistant *"read FIRST_TIME_SETUP.md and set up keep for me"* (that file ships alongside the binary). It will wire up the client pointer and walk you through attaching your first upstream.
 
