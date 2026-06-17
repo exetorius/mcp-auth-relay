@@ -12,25 +12,33 @@ It does nothing on its own: it needs an AI MCP client (you) connected to it. You
 
 ---
 
-## Step 1 — Start the relay
+## Step 1 — Start the relay (detached, so it outlives this chat)
 
 In the folder this file came in, find the mcp-keep program:
 
 - A standalone binary: `mcp-keep` (macOS/Linux) or `mcp-keep.exe` (Windows), **or**
 - the script `python/proxy.py` (run with `python proxy.py`) if this is a source checkout.
 
-Start it. It will:
+**Launch it detached.** This matters: mcp-keep is a long-running server, so if you (the AI) start it as an ordinary foreground command, your client may treat it as a *managed background task* and **kill it the moment this session ends** — the relay won't survive a restart. Start it so it's orphaned from your session instead:
+
+- **Windows:** `start "" mcp-keep.exe`  (or PowerShell: `Start-Process .\mcp-keep.exe`)
+- **macOS / Linux binary:** `./mcp-keep &`  (or `nohup ./mcp-keep >/dev/null 2>&1 &`)
+- **Source checkout:** `python proxy.py &`
+
+It will:
 - create its home at `~/.mcp-keep/` (override with the `MCP_KEEP_HOME` env var),
 - listen on `http://127.0.0.1:8089/mcp`,
 - run fine with **zero upstreams configured** — that's expected on first run.
 
-Leave it running. Confirm it's up:
+Confirm it's up:
 
 ```
 curl http://127.0.0.1:8089/mcp        # → "mcp-keep running"
 ```
 
 If port 8089 is taken, check whether mcp-keep is already running before starting another one — never start a second relay on the same port.
+
+> **Want it always running** (across reboots, with no relaunch)? That's the durable path — set up Start-with-OS. The relay's own `/keep-setup` terminal command registers it (Windows scheduled task / macOS launchd / Linux systemd user service). A detached launch survives until the machine is rebooted; Start-with-OS survives that too.
 
 ---
 
