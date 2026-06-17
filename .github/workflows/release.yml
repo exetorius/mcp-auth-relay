@@ -1,8 +1,15 @@
 name: Release
 
-# Build standalone, dependency-free mcp-keep binaries for Windows / macOS / Linux.
-# - Push a tag like v1.0.0  → builds, smoke-tests, and attaches binaries to a GitHub Release.
+# Build standalone, dependency-free mcp-keep bundles for Windows / macOS / Linux.
+# - Push a tag like v1.0.0  → builds, smoke-tests, and attaches per-OS zips to a GitHub Release.
 # - Manual run (workflow_dispatch) → builds + smoke-tests only (artifacts on the run, no Release).
+#
+# Each asset is a zip of a PyInstaller --onedir bundle: a single folder containing the
+# mcp-keep binary, its _internal/ runtime, plus FIRST_TIME_SETUP.md + LICENSE. onedir
+# (not --onefile) so the binary is a single supervised PID with no extracted child to
+# orphan, and FIRST_TIME_SETUP.md must ship alongside it — the setup assistant reads
+# that file to wire the client and launch the relay correctly. Without it, a fresh
+# download has nothing to set up from.
 on:
   push:
     tags: ["v*"]
@@ -26,7 +33,7 @@ jobs:
             asset: mcp-keep-macos-arm64
             ext: ""
           - os: windows-latest
-            asset: mcp-keep-windows-x86_64.exe
+            asset: mcp-keep-windows-x86_64
             ext: ".exe"
 
     steps:
@@ -40,23 +47,27 @@ jobs:
       - name: Install PyInstaller
         run: python -m pip install --upgrade pip pyinstaller
 
-      - name: Build one-file binary
-        run: pyinstaller --onefile --name mcp-keep --console python/proxy.py
+      - name: Build onedir bundle
+        run: pyinstaller --onedir --name mcp-keep --console python/proxy.py
 
       - name: Smoke test the built binary
-        run: python tests/smoke_binary.py "dist/mcp-keep${{ matrix.ext }}"
+        run: python tests/smoke_binary.py "dist/mcp-keep/mcp-keep${{ matrix.ext }}"
 
-      - name: Stage named artifact
+      - name: Bundle docs + zip the onedir folder
         shell: bash
         run: |
+          # Ship the onboarding doc + licence inside the folder the user unzips.
+          cp FIRST_TIME_SETUP.md LICENSE "dist/mcp-keep/"
           mkdir -p staged
-          cp "dist/mcp-keep${{ matrix.ext }}" "staged/${{ matrix.asset }}"
+          # Zip so it extracts to a top-level mcp-keep/ folder. Python (already set
+          # up) instead of `zip` so it's identical on all three runners.
+          python -c "import shutil; shutil.make_archive('staged/${{ matrix.asset }}', 'zip', root_dir='dist', base_dir='mcp-keep')"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
-          path: staged/${{ matrix.asset }}
+          path: staged/${{ matrix.asset }}.zip
           if-no-files-found: error
 
   release:
