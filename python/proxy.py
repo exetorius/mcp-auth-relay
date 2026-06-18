@@ -201,6 +201,46 @@ def save_cached_manifest(upstream_name: str, server_info: dict, tools: list) -> 
     }
     p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+def seed_cache_if_absent(upstream_name: str, pack_name: str) -> bool:
+    """Bootstrap the tool cache from a pack's shipped seed (#35).
+
+    Closes the first-ever-run gap: a brand-new user who installs a pack but
+    hasn't launched the upstream even once would otherwise see 0 tools until
+    the first capture. If the pack ships a `cache.seed.json` and the upstream
+    has no cache yet, copy it into the cache path so tools surface before the
+    upstream has *ever* been reachable.
+
+    Never clobbers a live-captured manifest — seeds only when none exists. The
+    seed is marked `"seeded": true` (and carries no `captured_at`) so it isn't
+    mistaken for a real capture; the capture loop overwrites it via
+    save_cached_manifest on the first successful connect, so staleness is
+    self-correcting.
+    """
+    if not pack_name:
+        return False
+    cp = cache_path(upstream_name)
+    if cp.exists():
+        return False                       # never clobber an existing (real or seeded) cache
+    seed = INTEGRATIONS_DIR / pack_name / "cache.seed.json"
+    if not seed.exists():
+        return False
+    try:
+        data = json.loads(seed.read_text(encoding="utf-8"))
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "serverInfo": data.get("serverInfo", {}),
+            "tools": data.get("tools", []),
+            "captured_at": None,
+            "seeded": True,
+        }
+        cp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        log(f"seeded cache for '{upstream_name}' from pack '{pack_name}' "
+            f"({len(payload['tools'])} tools) — pre-connect bootstrap (#35)")
+        return True
+    except Exception as e:
+        log(f"cache seed for '{upstream_name}' from pack '{pack_name}' failed: {e}")
+        return False
+
 # ---------------------------------------------------------------------------
 # Runtime state — built from cache on startup, refreshed by capture loop
 # ---------------------------------------------------------------------------
@@ -223,8 +263,10 @@ class State:
                 name = u["name"]
                 if not name:
                     continue
+                pack_name = u.get("integration", "")
+                seed_cache_if_absent(name, pack_name)   # #35: pre-connect bootstrap, no-op if cache exists
                 manifest = load_cached_manifest(name)
-                pack     = load_pack(u.get("integration", ""))
+                pack     = load_pack(pack_name)
                 self.upstreams[name] = {
                     "config": u, "manifest": manifest, "pack": pack,
                     "online": False, "auth_required": False,
