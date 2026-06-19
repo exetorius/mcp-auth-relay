@@ -35,6 +35,7 @@ import threading
 import urllib.request
 import urllib.error
 import socket
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
@@ -1028,6 +1029,19 @@ class KeepHandler(BaseHTTPRequestHandler):
 
 class QuietServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self):
+        # Skip HTTPServer.server_bind's socket.getfqdn() reverse-DNS lookup. On a
+        # host with no reverse resolver for 127.0.0.1 (e.g. macOS CI runners) that
+        # PTR query blocks until it times out — a deterministic ~30s — and stalls
+        # startup *after* we log "listening" but *before* the socket accepts. We're
+        # loopback-only and server_name is cosmetic, so bind the socket and set the
+        # name directly without the lookup.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
     def handle_error(self, request, client_address):
         if sys.exc_info()[0] in (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
