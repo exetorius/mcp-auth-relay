@@ -66,6 +66,8 @@ This is the step that can only happen outside chat: your client needs a pointer 
 
 **First-time bootstrap tip — add the upstream *before* this reload.** On a brand-new install there's no connected client yet, so `keep_add_upstream` (an MCP tool) isn't callable — this is exactly the "fall back to editing `config.json`" case (see Reference below). Ask the human now for their upstream's `host`/`port`/`path` (and bearer if needed) and write it into `~/.mcp-keep/config.json` *before* you reload. Why: the client handshakes its tool list **once per session**, so a single reload here surfaces both the `keep_*` tools **and** the fronted upstream's tools together. If you skip this and add the upstream afterward via `keep_add_upstream`, you'll need a **second reload** before the fronted tools appear. (For best results have the upstream reachable so it captures first — on a fresh home there's no cache until the first successful capture.) Use `keep_add_upstream` for adding *further* upstreams later, to an already-connected client.
 
+**Offer an integration pack — even when the user already knows their host/port.** A pack is *not* just a host/port lookup; it ships tool **hints, synthetic tools, and agent instructions** tailored to a specific upstream (e.g. VibeUE / Unreal), which is exactly what makes the fronted tools usable rather than a raw list. So whenever you know which server they're attaching, browse the registry and offer a match — don't reserve packs for the "they don't know their host/port" case. Browse it at `https://api.github.com/repos/exetorius/mcp-keep-integrations/contents/` (entries with `type: "dir"`, skipping dotfolders), name any that fit their server, and ask if they want one. If they pick one, set `"integration": "<pack>"` on the upstream you write into `config.json` here, then install the pack's files **after** the reload with `keep_install_pack name='<pack>'` (it isn't callable yet — no client is connected during this bootstrap).
+
 Then tell the human to **reload their AI client** so it picks up mcp-keep — in Claude Code, run `/mcp` and reconnect the `mcp-keep` server (a full restart also works).
 
 **This reload is required, not optional.** If the client was already running when you started the relay, its first attempt to reach mcp-keep failed (the relay wasn't up yet) and it will **not** re-handshake on its own mid-session — so `keep_*` won't appear as callable tools until you reload. Don't work around this with raw HTTP/`curl`; just reload, then drive everything through the tools. It's a one-time bootstrap step: with **Start-with-OS** (Step 1) the relay is always up *before* any session starts, so the tools surface with no reload at all.
@@ -81,10 +83,11 @@ After the reload, mcp-keep's tools are available to you. From here, **everything
 Otherwise, add it now through the tools:
 
 1. Call **`keep_welcome`** — it returns guided onboarding (only appears while no upstream is configured).
-2. Ask the human which MCP server they want to attach, and for its **host / port / path** (e.g. `127.0.0.1:8088/mcp`). If they don't know, call **`keep_install_pack`** with no arguments to list integration packs — these often carry sensible host/port defaults for known servers.
-3. Ask whether it needs auth (a bearer token). If unsure, add it without one — mcp-keep auto-detects required auth by probing for a `401`.
-4. Confirm the details back to the human, then call **`keep_add_upstream`** with `name` (their label) plus `host` / `port` / `path` (and `bearer_token` / `integration` if relevant). Note: tools fronted by a *newly* added upstream may need one more client reload to surface (the tool list handshakes once per session).
-5. Call **`keep_status`** to confirm it attached and see the cached tool count.
+2. Ask the human which MCP server they want to attach, and for its **host / port / path** (e.g. `127.0.0.1:8088/mcp`).
+3. **Offer an integration pack for it** (do this *regardless* of whether they knew the host/port — see Step 2's pack note for why a pack is worth it). Call **`keep_install_pack`** with no arguments to list packs, name any that match their server, and offer to install with `keep_install_pack name='<pack>'`. Packs also carry sensible host/port defaults, which helps if they were unsure.
+4. Ask whether it needs auth (a bearer token). If unsure, add it without one — mcp-keep auto-detects required auth by probing for a `401`.
+5. Confirm the details back to the human, then call **`keep_add_upstream`** with `name` (their label) plus `host` / `port` / `path` (and `bearer_token` / `integration` if relevant). Note: tools fronted by a *newly* added upstream may need one more client reload to surface (the tool list handshakes once per session).
+6. Call **`keep_status`** to confirm it attached and see the cached tool count.
 
 That's it. mcp-keep will now keep that server's tools surfaced to you even when it's offline.
 

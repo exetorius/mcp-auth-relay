@@ -81,6 +81,16 @@ def main() -> int:
     pathlib.Path(home, "config.json").write_text(json.dumps(
         {"listen_port": RELAY_PORT, "capture_interval_seconds": 5, "upstreams": []}))
 
+    # A pack that ships a pre-baked tool cache (#35). An upstream attached to this
+    # pack must surface its tools BEFORE it has ever connected — proven below by
+    # pointing such an upstream at a dead port and never bringing it online.
+    seed_pack = pathlib.Path(home, "integrations", "SeedPack")
+    seed_pack.mkdir(parents=True, exist_ok=True)
+    (seed_pack / "cache.seed.json").write_text(json.dumps(
+        {"serverInfo": {"name": "seed-upstream"},
+         "tools": [{"name": "seeded_only_tool", "description": "from pack seed",
+                    "inputSchema": {"type": "object", "properties": {}}}]}))
+
     upstream = _Threaded(("127.0.0.1", UP_PORT), _Upstream)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
 
@@ -172,6 +182,16 @@ def main() -> int:
         down = rpc("tools/call", {"name": "fake_echo", "arguments": {}}, 5)
         check("clear error when calling tool of a down upstream",
               "not running" in json.dumps(down) or "error" in down)
+
+        # #35 — pre-baked pack cache: attach an upstream that ships a seed, pointed
+        # at a dead port (9 = discard, refused), and never bring it online. Its
+        # seeded tool must surface from the pack seed before any successful capture.
+        rpc("tools/call", {"name": "keep_add_upstream",
+                           "arguments": {"name": "seeded", "host": "127.0.0.1",
+                                         "port": 9, "path": "/",
+                                         "integration": "SeedPack"}}, 6)
+        check("SEED (#35): pack-seeded tool surfaces before first-ever connect",
+              "seeded_only_tool" in tool_names())
     except Exception as e:  # noqa: BLE001 - surface anything as a failure
         check(f"unexpected exception: {e!r}", False)
     finally:
