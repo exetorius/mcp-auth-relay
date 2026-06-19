@@ -24,6 +24,7 @@ Terminal commands (type while running):
   /keep-quit    — stop
 """
 
+import hashlib
 import json
 import os
 import pathlib
@@ -52,7 +53,7 @@ PACKS_REPO   = "exetorius/mcp-keep-integrations"
 PACKS_BRANCH = "main"
 
 SERVER_NAME = "mcp-keep"
-VERSION     = "1.3.0"
+VERSION     = "1.4.0"
 
 # MCP protocol revision (the spec versions revisions by date, not semver).
 # Pinned to the oldest stable revision for maximum upstream interop; the only
@@ -142,7 +143,8 @@ CONFIG_DEFAULTS = {
     "listen_port":     8089,
     "max_body_bytes":  4 * 1024 * 1024,   # 4 MB body cap (brick 16)
     "allowed_origins": [],                # browser Origins allowed (brick 14); empty by default
-    "capture_interval_seconds": 30,       # re-attach poll cadence
+    "capture_interval_seconds": 30,       # fast poll cadence while an upstream is DOWN (re-attach)
+    "online_heartbeat_seconds": 300,      # cheap liveness check cadence while ONLINE (#40); no tools/list pull
     "upstreams":       [],
     "startup_asked":      False,
     "startup_registered": False,
@@ -350,6 +352,10 @@ class State:
                 self.upstreams[name] = {
                     "config": u, "manifest": manifest, "pack": pack,
                     "online": False, "auth_required": False,
+                    # #40 cadence/observability: when the live tool surface was last
+                    # PROVEN fresh (a real tools/list pull this session), a hash of it
+                    # to skip churn when unchanged, and the last cheap liveness ping.
+                    "captured_at": None, "tools_hash": "", "last_liveness": 0.0,
                 }
                 self._index_tools(name, manifest.get("tools", []), pack)
 
@@ -500,20 +506,60 @@ def capture_upstream(u: dict) -> bool:
         return False
 
     tools = (obj.get("result") or {}).get("tools", [])
-    save_cached_manifest(name, server_info, tools)
+    new_hash = _tools_hash(tools)
+    now = time.time()
 
     with STATE.lock:
         st = STATE.upstreams.get(name)
+        unchanged = st is not None and st.get("tools_hash") == new_hash and bool(tools)
         if st is not None:
             st["manifest"] = {"serverInfo": server_info, "tools": tools}
             st["online"] = True
             st["auth_required"] = auth_required
+            st["tools_hash"] = new_hash
+            st["captured_at"] = now      # last time the surface was PROVEN fresh
+            st["last_liveness"] = now
             STATE._index_tools(name, tools, st["pack"])
+
+    # Skip churn (#40): only rewrite the on-disk cache when the tool surface
+    # actually changed — an identical re-capture is a no-op on disk.
+    if not unchanged:
+        save_cached_manifest(name, server_info, tools)
 
     identity = server_info.get("name", "?")
     log(f"captured '{name}' (identity='{identity}', {len(tools)} tools, "
-        f"auth={'required' if auth_required else 'none'})")
+        f"auth={'required' if auth_required else 'none'}"
+        f"{', unchanged' if unchanged else ''})")
     return True
+
+def _tools_hash(tools: list) -> str:
+    """Stable hash of a tool surface, to detect unchanged captures (#40)."""
+    blob = json.dumps(tools, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+def _ago(ts: float) -> str:
+    """Human relative time for keep_status freshness (#40)."""
+    secs = max(0, int(time.time() - ts))
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+def liveness_ok(u: dict) -> bool:
+    """Cheap transport health check (#40): can we open a TCP connection to the
+    upstream? Proves liveness WITHOUT a full initialize + tools/list handshake,
+    so a healthy upstream isn't spammed with a 21 KB catalog pull every cycle."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(2.0)
+    try:
+        return s.connect_ex((u["host"], int(u["port"]))) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 def _mark(name: str, online: bool, auth_required: bool):
     with STATE.lock:
@@ -521,6 +567,8 @@ def _mark(name: str, online: bool, auth_required: bool):
         if st is not None:
             st["online"] = online
             st["auth_required"] = auth_required
+            if not online:
+                st["last_liveness"] = 0.0   # force a fresh full capture on next poll
 
 def _safe_capture(u: dict):
     """Capture one upstream, swallowing the expected offline/transient errors."""
@@ -534,16 +582,41 @@ def _safe_capture(u: dict):
         log(f"capture error for '{u['name']}': {e}")
 
 def capture_loop():
-    """Background re-attach: poll every upstream; refresh cache when reachable.
-    Also hot-reloads config.json when it changes on disk (#47), so a hand-edited
-    config takes effect within one capture interval — no restart, no console."""
+    """Background re-attach with an INVERTED cadence (#40):
+
+    - DOWN / not-yet-captured upstream  -> poll FAST (capture_interval_seconds):
+      full initialize + tools/list to (re)attach. No log-spam cost — it's down.
+    - ONLINE + captured upstream        -> stay quiet: a cheap TCP liveness check
+      only every online_heartbeat_seconds, and NEVER a tools/list pull. The cache
+      is the source of truth while healthy; freshness is re-proven only on the
+      next (re)attach or an explicit signal. A lost liveness ping flips it back
+      to DOWN, which resumes fast polling.
+
+    Also hot-reloads config.json when it changes on disk (#47), within one tick."""
     _sync_config_mtime()
     while True:
         mt = _config_mtime()
         if mt and mt != _last_config_mtime:
             reload_config("config.json changed on disk")
+        now = time.time()
+        heartbeat = max(30, int(STATE.cfg.get("online_heartbeat_seconds", 300)))
         for u in list(STATE.cfg["upstreams"]):
-            _safe_capture(u)
+            name = u.get("name")
+            if not name:
+                continue
+            st = STATE.upstreams.get(name)
+            if st and st.get("online"):
+                # Healthy: cheap liveness only, on the slow heartbeat — no handshake.
+                if now - st.get("last_liveness", 0.0) >= heartbeat:
+                    if liveness_ok(u):
+                        with STATE.lock:
+                            st["last_liveness"] = now
+                    else:
+                        log(f"liveness lost for '{name}' — marking down, will re-capture")
+                        _mark(name, online=False, auth_required=st.get("auth_required", False))
+            else:
+                # Down or never captured this session: poll hard to (re)attach.
+                _safe_capture(u)
         time.sleep(max(5, int(STATE.cfg.get("capture_interval_seconds", 30))))
 
 # ---------------------------------------------------------------------------
@@ -781,8 +854,11 @@ def handle_management_call(req_id, tool_name: str, args: dict):
                     auth_str = "required (bearer set)"
                 else:
                     auth_str = "none"
+                fresh = (f"verified fresh {_ago(st['captured_at'])}"
+                         if st.get("captured_at")
+                         else "from cache, not verified this session")
                 lines.append(f"  • {name}: {state_str}, identity='{ident}', "
-                             f"{len(tools)} cached tools, auth={auth_str}")
+                             f"{len(tools)} cached tools ({fresh}), auth={auth_str}")
         if needs_token:
             who = ", ".join(needs_token)
             lines.append(
@@ -1040,6 +1116,13 @@ class KeepHandler(BaseHTTPRequestHandler):
                 log(f"tools/call '{tool_name}' -> '{u['name']}'")
             else:
                 msg = resp.decode(errors="replace").strip() if resp else ""
+                if not msg:
+                    # Transport failure on a real call = the upstream is down.
+                    # Mark it lazily (#40) so the capture loop resumes fast polling
+                    # for re-attach — this is how a user actually notices ("UE crashed"),
+                    # without us proactively handshaking a healthy upstream every cycle.
+                    _mark(u["name"], online=False,
+                          auth_required=STATE.upstreams.get(u["name"], {}).get("auth_required", False))
                 detail = (f"Upstream '{u['name']}' rejected the call: {msg}"
                           if msg else
                           f"Upstream '{u['name']}' is not running. Start it, then retry '{tool_name}'.")
