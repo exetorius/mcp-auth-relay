@@ -56,6 +56,8 @@ PROXY      = REPO_ROOT / "python" / "proxy.py"
 
 # --- fake upstream MCP server: initialize + tools/list + tools/call ----------
 class _Upstream(http.server.BaseHTTPRequestHandler):
+    init_count = 0  # full handshakes seen — asserts the #40 inverted cadence
+
     def log_message(self, *a):  # silence
         pass
 
@@ -64,6 +66,7 @@ class _Upstream(http.server.BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(n) or b"{}")
         method, rid = req.get("method"), req.get("id")
         if method == "initialize":
+            type(self).init_count += 1
             result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                       "serverInfo": {"name": "fake-upstream", "version": "0.1"}}
         elif method == "tools/list":
@@ -167,8 +170,12 @@ def main() -> int:
 
     home = tempfile.mkdtemp(prefix="keep-itest-")
     # Pre-seed config so capture polls quickly (capture_loop enforces a 5s floor).
+    # online_heartbeat very high so a HEALTHY upstream stays fully quiet during the
+    # test window — isolates the #40 cadence + lazy-mark-down assertions from the
+    # slow liveness timer (capture_interval is the fast DOWN-poll).
     pathlib.Path(home, "config.json").write_text(json.dumps(
-        {"listen_port": RELAY_PORT, "capture_interval_seconds": 5, "upstreams": []}))
+        {"listen_port": RELAY_PORT, "capture_interval_seconds": 5,
+         "online_heartbeat_seconds": 3600, "upstreams": []}))
 
     # A pack that ships a pre-baked tool cache (#35). An upstream attached to this
     # pack must surface its tools BEFORE it has ever connected — proven below by
@@ -260,19 +267,32 @@ def main() -> int:
         text = call.get("result", {}).get("content", [{}])[0].get("text", "")
         check("ROUTING: tools/call fake_echo reaches upstream", "ECHO OK" in text)
 
+        # #40 — INVERTED CADENCE: a healthy, captured upstream must NOT be
+        # re-handshaked every cycle. Snapshot its initialize count, wait past one
+        # capture interval, and assert it didn't climb (the relay stays quiet).
+        init_before = _Upstream.init_count
+        time.sleep(7)  # > capture_interval_seconds (5)
+        check("CADENCE (#40): healthy upstream not re-handshaked each cycle",
+              _Upstream.init_count == init_before)
+
         # Truly take the upstream down (close the socket so the port is refused).
         upstream.shutdown()
         upstream.server_close()
-        time.sleep(8)  # > one capture poll, so 'online' flips to False
 
+        # Cache still serves the tool list regardless of the online flag.
         check("CACHE-WHEN-DOWN: fake_echo still listed while offline",
               "fake_echo" in tool_names())
-        status = rpc("tools/call", {"name": "keep_status", "arguments": {}}, 4)
-        status_text = status["result"]["content"][0]["text"]
-        check("keep_status reports OFFLINE / serving cache", "OFFLINE" in status_text)
+
+        # #40 — LAZY MARK-DOWN: a real failed call (how a user actually notices a
+        # crash) flips the upstream offline; we don't proactively poll a healthy one.
         down = rpc("tools/call", {"name": "fake_echo", "arguments": {}}, 5)
         check("clear error when calling tool of a down upstream",
               "not running" in json.dumps(down) or "error" in down)
+        status = rpc("tools/call", {"name": "keep_status", "arguments": {}}, 4)
+        status_text = status["result"]["content"][0]["text"]
+        check("keep_status reports OFFLINE / serving cache", "OFFLINE" in status_text)
+        check("FRESHNESS (#40): keep_status shows a verified-fresh / cache time",
+              "verified fresh" in status_text or "not verified" in status_text)
 
         # #35 — pre-baked pack cache: attach an upstream that ships a seed, pointed
         # at a dead port (9 = discard, refused), and never bring it online. Its

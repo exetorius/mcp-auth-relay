@@ -124,7 +124,8 @@ A hand-edit to `~/.mcp-keep/config.json` on a *running* relay is picked up autom
 | `listen_port` | Single master port the client connects to (default 8089) |
 | `max_body_bytes` | Reject bodies larger than this with `413` (default 4 MB) |
 | `allowed_origins` | Browser `Origin` values allowed (exact `scheme://host:port`). Empty by default. |
-| `capture_interval_seconds` | Background re-attach poll cadence (default 30) |
+| `capture_interval_seconds` | Fast re-attach poll cadence while an upstream is **down** (default 30) |
+| `online_heartbeat_seconds` | Cheap liveness-check cadence while an upstream is **online** — no `tools/list` pull (default 300, #40) |
 | `upstreams[].name` | User's local label — cache key, routing, status |
 | `upstreams[].host` / `.port` / `.path` | Where the upstream MCP server lives |
 | `upstreams[].bearer_token` | Optional, injected as `Authorization: Bearer` for that upstream only |
@@ -141,7 +142,7 @@ MCP client (Claude Code) → mcp-keep :8089 → upstream MCP server(s)
 
 - `initialize` — answered by the relay, never forwarded. Protocol version echoed exactly.
 - `tools/list` — aggregated from every upstream's on-disk cache + pack hints/synthetic tools + management tools (`keep_status`, `keep_install_pack`). Upstreams can all be offline.
-- Capture loop — background handshake (`initialize` + `tools/list`, 401 auth probe) against each upstream; writes the cache and learns `serverInfo.name`.
+- Capture loop — inverted cadence (#40): a **down** upstream is polled fast with a full handshake (`initialize` + `tools/list`, 401 auth probe) to re-attach; an **online** one stays quiet — only a cheap TCP liveness check on a slow heartbeat, never a `tools/list` pull. A failed `tools/call` lazily marks an upstream down. The cache (with a tool-list hash + last-verified time, shown in `keep_status`) is the source of truth while healthy.
 - `tools/call` — routed to the owning upstream by tool name, bearer injected per-upstream. Clear error if down.
 - Security gates — always-on: loopback `Host` only, browser `Origin` must be allowlisted, body size cap. DNS-rebinding defence; not loosenable without explicit opt-in.
 
