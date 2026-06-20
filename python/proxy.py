@@ -29,6 +29,7 @@ import json
 import os
 import pathlib
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -53,7 +54,7 @@ PACKS_REPO   = "exetorius/mcp-keep-integrations"
 PACKS_BRANCH = "main"
 
 SERVER_NAME = "mcp-keep"
-VERSION     = "1.5.0"
+VERSION     = "1.6.0"
 
 # MCP protocol revision (the spec versions revisions by date, not semver).
 # Pinned to the oldest stable revision for maximum upstream interop; the only
@@ -217,6 +218,10 @@ def upstream_url(u: dict) -> str:
 # Integration packs — per upstream: hints, synthetic tools, instructions
 # ---------------------------------------------------------------------------
 
+def pack_installed(name: str) -> bool:
+    """True if an integration pack named `name` is present on disk (#58)."""
+    return bool(name) and (INTEGRATIONS_DIR / name).exists()
+
 def load_pack(name: str) -> dict:
     """Load a pack's hints / synthetic tools / instructions. Safe if missing."""
     pack = {"hints": {}, "synthetic_tools": [], "instructions": ""}
@@ -224,6 +229,10 @@ def load_pack(name: str) -> dict:
         return pack
     base = INTEGRATIONS_DIR / name
     if not base.exists():
+        # #58: an upstream references a pack that isn't installed. Don't swallow
+        # it silently — log so it's diagnosable; keep_status surfaces it too.
+        log(f"integration '{name}' is set but the pack is not installed "
+            f"({base}) — run keep_install_pack name='{name}' to install it.")
         return pack
     try:
         hp = base / "hints.json"
@@ -665,9 +674,15 @@ def error_result(req_id, text: str) -> dict:
 # Tools mcp-keep answers itself (never forwarded to an upstream). The tools/call
 # dispatcher routes any name in this set to handle_management_call().
 MANAGEMENT_TOOL_NAMES = {
-    "keep_status", "keep_install_pack", "keep_add_upstream", "keep_remove_upstream",
-    "keep_welcome", "keep_start_with_os", "keep_disable_start_with_os", "keep_reload",
+    "keep_status", "keep_install_pack", "keep_remove_pack",
+    "keep_add_upstream", "keep_remove_upstream", "keep_welcome",
+    "keep_start_with_os", "keep_disable_start_with_os", "keep_reload",
 }
+
+def _missing_packs(state: "State") -> list[str]:
+    """Integration names referenced by an upstream but not installed on disk (#58)."""
+    return [u["integration"] for u in state.cfg["upstreams"]
+            if u.get("integration") and not pack_installed(u["integration"])]
 
 def management_tools(state: "State") -> list[dict]:
     tools = []
@@ -750,8 +765,13 @@ def management_tools(state: "State") -> list[dict]:
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     })
 
-    # Offer pack install whenever an upstream has no integration set.
-    if any(not u.get("integration") for u in state.cfg["upstreams"]) or not state.cfg["upstreams"]:
+    # Offer pack install whenever an upstream has no integration set, OR an
+    # upstream references a pack that isn't installed on disk (#58 — without the
+    # second clause an `integration` pointing at a missing pack hides the very
+    # tool needed to install it: a silent catch-22).
+    if (any(not u.get("integration") for u in state.cfg["upstreams"])
+            or not state.cfg["upstreams"]
+            or _missing_packs(state)):
         tools.append({
             "name": "keep_install_pack",
             "description": ("Install an integration pack. Call with no arguments to list "
@@ -762,6 +782,27 @@ def management_tools(state: "State") -> list[dict]:
                 "properties": {"name": {"type": "string",
                                "description": "Pack to install. Omit to list available packs."}},
                 "required": [],
+            },
+        })
+
+    # Removal counterpart to keep_install_pack (#59) — surfaced only when there's
+    # a pack to remove: one installed on disk, or an upstream still referencing one
+    # (so it can also clear a dangling integration that points at a missing pack).
+    _installed = [p.name for p in INTEGRATIONS_DIR.iterdir()
+                  if p.is_dir() and not p.name.startswith(".")] if INTEGRATIONS_DIR.exists() else []
+    if _installed or any(u.get("integration") for u in state.cfg["upstreams"]):
+        tools.append({
+            "name": "keep_remove_pack",
+            "description": ("Remove an integration pack: detaches it from any upstream that "
+                            "references it (clears their 'integration') AND deletes it from "
+                            "~/.mcp-keep/integrations/. Mirror of keep_install_pack. Confirm with "
+                            "the user before calling — it writes config and deletes files. Re-install "
+                            "later with keep_install_pack if needed."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string",
+                               "description": "The pack name to remove (as shown by keep_status / keep_install_pack)."}},
+                "required": ["name"],
             },
         })
 
@@ -871,6 +912,38 @@ def handle_management_call(req_id, tool_name: str, args: dict):
                   "Its tool cache is kept, so re-adding the same name restores it instantly. "
                   "Call keep_status to confirm.")
 
+    if tool_name == "keep_remove_pack":
+        a = args or {}
+        name = str(a.get("name") or "").strip()
+        if not name:
+            return error_result(req_id,
+                "keep_remove_pack needs a 'name' — the pack to remove (as shown by "
+                "keep_status / keep_install_pack).")
+        # Reload fresh from disk so we don't clobber a concurrent change.
+        cfg = load_config()
+        detached = [u["name"] for u in cfg["upstreams"] if u.get("integration") == name]
+        base = INTEGRATIONS_DIR / name
+        had_files = base.exists()
+        if not detached and not had_files:
+            return error_result(req_id,
+                f"Nothing to remove for pack '{name}': no upstream references it and it "
+                "is not installed in ~/.mcp-keep/integrations/.")
+        for u in cfg["upstreams"]:
+            if u.get("integration") == name:
+                u["integration"] = ""
+        if had_files:
+            shutil.rmtree(base, ignore_errors=True)
+        save_config(cfg)
+        STATE.cfg = cfg
+        STATE.rebuild_from_cache()
+        _sync_config_mtime()   # our own write — don't let the hot-reload re-fire on it
+        did = []
+        if detached:
+            did.append(f"detached from {', '.join(detached)}")
+        did.append("deleted from disk" if had_files else "was not installed on disk")
+        return ok(f"Removed pack '{name}' ({'; '.join(did)}). "
+                  "Re-install later with keep_install_pack if needed. Call keep_status to confirm.")
+
     if tool_name == "keep_reload":
         n = reload_config("keep_reload tool")
         return ok(f"Reloaded config + integration packs — {n} upstream(s) configured. "
@@ -908,6 +981,16 @@ def handle_management_call(req_id, tool_name: str, args: dict):
                 "configured — it will stay offline until you set one. Add it via "
                 "keep_add_upstream (re-run with the same name plus bearer_token) or edit "
                 "config.json. A bearer is recommended for any upstream's security.")
+        # #58: an integration set but the pack absent from disk would otherwise be
+        # silent (load_pack returns empty). Surface it with the recovery path.
+        for u in STATE.cfg["upstreams"]:
+            pk = u.get("integration")
+            if pk and not pack_installed(pk):
+                lines.append(
+                    f"\nPack: upstream '{u['name']}' has integration '{pk}' set but that "
+                    "pack is not installed in ~/.mcp-keep/integrations/ — its hints and "
+                    f"synthetic tools won't load. Run keep_install_pack name='{pk}' to install "
+                    f"it, or keep_remove_pack name='{pk}' to detach it.")
         # Self-quieting steer toward start-with-OS (issue #31). Shown only while
         # NOT registered for OS startup — the instant keep_start_with_os flips the
         # flag, this regenerates without the note (state lives in one place, no
