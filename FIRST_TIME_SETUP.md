@@ -114,7 +114,7 @@ Only after an upstream is attached and working:
    - **install it** — go ahead; or
    - **skip it** — the upstream works fine as-is.
    Lead with the offer to explain, so they're never forced to choose blind.
-3. **Install only on an explicit yes.** On consent, call `keep_install_pack name='<pack>'` to download and install it into `~/.mcp-keep/integrations/<pack>/` and run any post-install steps. This also sets the upstream's `integration` to that pack.
+3. **Install only on an explicit yes.** On consent, call `keep_install_pack name='<pack>'` to download it into `~/.mcp-keep/integrations/<pack>/`, run any post-install steps, and **attach it to an upstream** — auto when unambiguous (one upstream, or one whose name matches the pack), otherwise pass `upstream='<name>'` to attach explicitly.
 4. If they decline, leave it — the upstream works fine without a pack. Don't re-ask or auto-install later.
 
 > **Never** pick a pack, set `integration:`, or run `keep_install_pack name=...` without the human first saying yes to that specific pack. Browsing/listing packs is fine; installing one is a privileged effect that needs consent.
