@@ -100,7 +100,7 @@ Only after an upstream is attached and working:
 
 1. Call **`keep_install_pack`** with **no arguments** to list available packs.
 2. If a pack matches the attached upstream (e.g. they attached VibeUE and a `vibeue` pack exists), tell them it's available as an **optional enhancement** and offer **three paths**: **explain it** (describe what it adds and how it helps *their* upstream), **install it**, or **skip it**. Lead with the offer to explain so they never choose blind.
-3. **Install only on an explicit yes** → `keep_install_pack name='<pack>'` downloads it into `~/.mcp-keep/integrations/<pack>/`, runs post-install steps, and sets the upstream's `integration`. (Manual fallback: download each file's `download_url` from `.../contents/<pack>` into that folder; read the pack's `README.md`/`config.example.json`.)
+3. **Install only on an explicit yes** → `keep_install_pack name='<pack>'` downloads it into `~/.mcp-keep/integrations/<pack>/`, runs post-install steps, and **attaches it to an upstream** — auto when unambiguous (one upstream, or one whose name matches the pack), else pass `upstream='<name>'` to attach explicitly (#67). Re-running it updates the pack (versioned + prunes, #65). (Manual fallback: download each file's `download_url` from `.../contents/<pack>` into that folder, then set the upstream's `integration` and `keep_reload`.)
 4. If they decline, leave it — the upstream works fine without a pack. Don't re-ask or auto-install later.
 
 > **Never** pick a pack, set `integration:`, or run `keep_install_pack name=...` without the user first saying yes to that specific pack. Listing packs is fine; installing is a privileged effect needing consent.

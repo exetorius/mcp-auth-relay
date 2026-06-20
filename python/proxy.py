@@ -54,7 +54,7 @@ PACKS_REPO   = "exetorius/mcp-keep-integrations"
 PACKS_BRANCH = "main"
 
 SERVER_NAME = "mcp-keep"
-VERSION     = "1.7.0"
+VERSION     = "1.8.0"
 
 # MCP protocol revision (the spec versions revisions by date, not semver).
 # Pinned to the oldest stable revision for maximum upstream interop; the only
@@ -837,13 +837,20 @@ def management_tools(state: "State") -> list[dict]:
             or _missing_packs(state)):
         tools.append({
             "name": "keep_install_pack",
-            "description": ("Install an integration pack. Call with no arguments to list "
-                            "available packs, or name='<pack>' to install one. Packs add tool "
-                            "hints, synthetic tools, and agent instructions for an upstream."),
+            "description": ("Install (or update) an integration pack. Call with no arguments to "
+                            "list available packs, or name='<pack>' to install one. Downloads the "
+                            "pack AND attaches it to an upstream: auto-attaches when unambiguous "
+                            "(one upstream, or one whose name matches the pack), or pass "
+                            "upstream='<name>' to attach explicitly. Packs add tool hints, "
+                            "synthetic tools, and agent instructions for that upstream."),
             "inputSchema": {
                 "type": "object",
-                "properties": {"name": {"type": "string",
-                               "description": "Pack to install. Omit to list available packs."}},
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "Pack to install/update. Omit to list available packs."},
+                    "upstream": {"type": "string",
+                                 "description": "Upstream to attach the pack to (sets its integration). Optional — auto-attaches when unambiguous."},
+                },
                 "required": [],
             },
         })
@@ -892,6 +899,44 @@ def management_tools(state: "State") -> list[dict]:
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     })
     return tools
+
+def _attach_pack_after_install(pack_name: str, want: str) -> str:
+    """Link a freshly-installed pack to an upstream (#67) — download alone doesn't.
+
+    Explicit `want` (upstream name) overrides. Otherwise auto-attach only when
+    unambiguous: a single upstream, or one whose name matches the pack — and never
+    silently overwrite an upstream already using a *different* pack. Returns a
+    human-readable status note; writes + persists config when it attaches."""
+    cfg = load_config()
+    ups = cfg["upstreams"]
+    names = ", ".join(u.get("name", "?") for u in ups) or "(none)"
+    if want:
+        target = next((u for u in ups if u.get("name") == want), None)
+        if target is None:
+            return (f"NOTE: no upstream named '{want}' to attach to (have: {names}). "
+                    "Files installed but not attached.")
+    elif not ups:
+        return ("No upstream is configured yet — add one and attach this pack with "
+                f"keep_add_upstream (set integration='{pack_name}').")
+    elif len(ups) == 1:
+        target = ups[0]
+    else:
+        target = next((u for u in ups if u.get("name") == pack_name), None)
+        if target is None:
+            return ("Multiple upstreams exist and none matches the pack name, so it was NOT "
+                    f"auto-attached. Re-run keep_install_pack name='{pack_name}' "
+                    f"upstream='<one of: {names}>' to attach it.")
+    cur = target.get("integration") or ""
+    if cur == pack_name:
+        return f"Already attached to upstream '{target['name']}'."
+    if not want and cur:
+        return (f"NOTE: upstream '{target['name']}' already uses pack '{cur}', so it was NOT "
+                f"changed. Re-run keep_install_pack name='{pack_name}' upstream='{target['name']}' "
+                "to switch it.")
+    target["integration"] = pack_name
+    save_config(cfg)
+    _sync_config_mtime()   # our own write — don't let the hot-reload re-fire on it
+    return f"Attached to upstream '{target['name']}' (integration='{pack_name}')."
 
 def handle_management_call(req_id, tool_name: str, args: dict):
     def ok(text):
@@ -1035,6 +1080,10 @@ def handle_management_call(req_id, tool_name: str, args: dict):
                     needs_token.append(name)
                 elif st["auth_required"]:
                     auth_str = "required (bearer set)"
+                elif cfg_bearer.get(name):
+                    # #68: a bearer IS configured; we just haven't probed a 401 this
+                    # session (e.g. upstream offline). Don't render that as "none".
+                    auth_str = "none detected (bearer configured)"
                 else:
                     auth_str = "none"
                 fresh = (f"verified fresh {_ago(st['captured_at'])}"
@@ -1100,7 +1149,8 @@ def handle_management_call(req_id, tool_name: str, args: dict):
         return ok("\n".join(lines))
 
     if tool_name == "keep_install_pack":
-        pack_name = (args or {}).get("name", "")
+        a = args or {}
+        pack_name = a.get("name", "")
         if not pack_name:
             try:
                 packs = list_available_packs()
@@ -1112,9 +1162,13 @@ def handle_management_call(req_id, tool_name: str, args: dict):
         if not success:
             return error_result(req_id, f"Download failed: {msg}")
         post = run_post_install(INTEGRATIONS_DIR / pack_name)
+        # #67: downloading alone doesn't link the pack — attach it to an upstream.
+        attach_msg = _attach_pack_after_install(pack_name, str(a.get("upstream") or "").strip())
         STATE.cfg = load_config()
         STATE.rebuild_from_cache()
-        text = f"{msg}"
+        text = msg
+        if attach_msg:
+            text += f"\n\n{attach_msg}"
         if post:
             text += f"\n\n{post}"
         return ok(text)
