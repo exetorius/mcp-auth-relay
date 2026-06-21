@@ -107,13 +107,15 @@ Only after an upstream is attached and working:
 
 ---
 
-# Phase 4 — Start with OS (optional)
+# Phase 4 — Start with OS + crash-restart (optional)
 
 Ask if they want mcp-keep to start automatically at login. The easiest path is the `keep_start_with_os` MCP tool (undo with `keep_disable_start_with_os`); the relay's own `/keep-setup` terminal command does the same. Show the user the exact change first — it's a launch-surface effect. The underlying per-OS mechanism (all per-user, **no admin/elevation**):
 
-- **Windows:** HKCU `Run` registry value `mcp-keep` → the launch command. (Not Task Scheduler — `schtasks /SC ONLOGON` requires elevation, which defeats enabling it conversationally.)
-- **Mac:** launchd plist at `~/Library/LaunchAgents/com.mcp-keep.plist`
-- **Linux:** systemd user service at `~/.config/systemd/user/mcp-keep.service`
+- **Windows:** HKCU `Run` registry value `mcp-keep` → a `--watchdog` supervisor that launches the relay at login **and restarts it on crash** (#2). (Not Task Scheduler — `schtasks /SC ONLOGON` requires elevation, which defeats enabling it conversationally.)
+- **Mac:** launchd plist at `~/Library/LaunchAgents/com.mcp-keep.plist` (`KeepAlive` → restarts on crash).
+- **Linux:** systemd user service at `~/.config/systemd/user/mcp-keep.service` (`Restart=on-failure`).
+
+**Crash-restart comes *with* start-with-OS, not a manual start.** A manual/AI start (the Phase 1.1 detached `--serve` launch) runs the bare relay with **no supervisor** — that's fine and expected, it just won't auto-restart if it dies. Enabling start-with-OS is what installs the supervisor (the Windows watchdog, launchd `KeepAlive`, systemd `Restart=`), so for "always up in production" recommend enabling it. On Windows, `keep_disable_start_with_os` also stops a running watchdog (so disable means *stopped now*) but leaves the current relay running unsupervised this session. After upgrading the binary, re-run `keep_start_with_os` so the Run key repoints from any old `--serve` value to `--watchdog`.
 
 ---
 
